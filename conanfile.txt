@@ -1,0 +1,11 @@
+[generators]
+cmake_paths
+cmake_find_package_multi
+
+[requires]
+flatbuffers/23.1.21
+protobuf/3.21.9
+# boost/1.81.0@ct/ct
+# openssl/1.1.1k
+# zlib/1.2.12@ct/ct
+# sqlite3/3.36.0
