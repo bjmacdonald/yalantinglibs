@@ -17,6 +17,8 @@ include_directories(src/include)
 find_package(Threads REQUIRED)
 link_libraries(Threads::Threads)
 
+include(cmake/conan.cmake)
+
 include(cmake/utils.cmake)
 include(cmake/struct_pb.cmake)
 include(cmake/build.cmake)
