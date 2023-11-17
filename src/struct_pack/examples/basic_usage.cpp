@@ -60,10 +60,6 @@ struct person {
 
 //clang-format off
 void basic_usage() {
-  std::vector<int> a = {1, 2, 3};
-  auto sz =
-      struct_pack::get_needed_size<struct_pack::type_info_config::disable>(a);
-
   person p{20, "tom"};
 
   person p2{/*.age =*/21, /*.name =*/"Betty"};
@@ -87,7 +83,10 @@ void basic_usage() {
   // api 5. serialize with offset
   {
     auto buffer = struct_pack::serialize_with_offset(/* offset = */ 2, p);
-    assert(buffer[0] == '\0' && buffer[1] == '\0');
+    auto buffer2 = struct_pack::serialize(p);
+    bool result = std::string_view{buffer.data() + 2, buffer.size() - 2} ==
+                  std::string_view{buffer2.data(), buffer2.size()};
+    assert(result);
   }
   // api 6. serialize varadic param
   {
