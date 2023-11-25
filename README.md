@@ -165,7 +165,7 @@ More examples [here](https://github.com/alibaba/yalantinglibs/tree/main/src/coro
 
 Based on compile-time reflection, very easy to use, high performance serialization library, struct_pack is a header only library, it is used by coro_rpc now.
 
-Only one line code to finish serialization and deserialization, 2-50x faster than protobuf.
+Only one line code to finish serialization and deserialization, 2-20x faster than protobuf.
 
 ### quick example
 ```cpp
@@ -185,7 +185,7 @@ std::vector<char> buffer = struct_pack::serialize(person1);
 auto person2 = deserialize<person>(buffer);
 ```
 
-struct_pack is very faster. 
+struct_pack is very fast. 
 
 ![](https://alibaba.github.io/yalantinglibs/assets/struct_pack_bench_serialize.4ffb0ce6.png)
 

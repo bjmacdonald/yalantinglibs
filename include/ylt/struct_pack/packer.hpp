@@ -14,11 +14,16 @@
  * limitations under the License.
  */
 #pragma once
+#include <bitset>
+#include <cstddef>
 #include <cstdint>
+#include <type_traits>
 
 #include "calculate_size.hpp"
 #include "endian_wrapper.hpp"
 #include "reflection.hpp"
+#include "ylt/struct_pack/util.h"
+#include "ylt/struct_pack/varint.hpp"
 namespace struct_pack::detail {
 template <
 #if __cpp_concepts >= 201907L
@@ -97,21 +102,21 @@ class packer {
       auto metainfo = info.metainfo();
       write_wrapper<sizeof(char)>(writer_, (char *)&metainfo);
       if constexpr (serialize_static_config<serialize_type>::has_compatible) {
-        uint16_t len16;
-        uint32_t len32;
-        uint64_t len64;
+        std::size_t sz = info.size();
         switch (metainfo & 0b11) {
           case 1:
-            len16 = info.size();
-            write_wrapper<2>(writer_, (char *)&len16);
+            low_bytes_write_wrapper<2>(writer_, sz);
             break;
           case 2:
-            len32 = info.size();
-            write_wrapper<4>(writer_, (char *)&len32);
+            low_bytes_write_wrapper<4>(writer_, sz);
             break;
           case 3:
-            len64 = info.size();
-            write_wrapper<8>(writer_, (char *)&len64);
+            if constexpr (sizeof(std::size_t) >= 8) {
+              low_bytes_write_wrapper<8>(writer_, sz);
+            }
+            else {
+              unreachable();
+            }
             break;
           default:
             unreachable();
@@ -127,13 +132,13 @@ class packer {
   }
 
  private:
-  template <std::size_t size_type, uint64_t version, typename First,
-            typename... Args>
+  template <std::size_t size_type, uint64_t version,
+            std::uint64_t parent_tag = 0, typename First, typename... Args>
   constexpr void STRUCT_PACK_INLINE serialize_many(const First &first_item,
                                                    const Args &...items) {
-    serialize_one<size_type, version>(first_item);
+    serialize_one<size_type, version, parent_tag>(first_item);
     if constexpr (sizeof...(items) > 0) {
-      serialize_many<size_type, version>(items...);
+      serialize_many<size_type, version, parent_tag>(items...);
     }
   }
   constexpr void STRUCT_PACK_INLINE write_padding(std::size_t sz) {
@@ -143,11 +148,96 @@ class packer {
     }
   }
 
-  template <std::size_t size_type, uint64_t version, typename T>
+  template <uint64_t parent_tag, std::size_t sz, typename Arg,
+            typename unsigned_t, typename signed_t>
+  static constexpr void STRUCT_PACK_INLINE
+  get_fast_varint_width_impl(char (&vec)[sz], unsigned int &i, const Arg &item,
+                             unsigned_t &unsigned_max, signed_t &signed_max) {
+    if constexpr (varint_t<Arg, parent_tag>) {
+      if (get_varint_value(item) != 0) {
+        vec[i / 8] |= (0b1 << (i % 8));
+        if constexpr (std::is_unsigned_v<std::remove_reference_t<
+                          decltype(get_varint_value(item))>>) {
+          unsigned_max =
+              std::max<unsigned_t>(unsigned_max, get_varint_value(item));
+        }
+        else {
+          signed_max = std::max<signed_t>(signed_max,
+                                          get_varint_value(item) > 0
+                                              ? get_varint_value(item)
+                                              : -(get_varint_value(item) + 1));
+        }
+      }
+      ++i;
+    }
+  }
+
+  template <uint64_t parent_tag, std::size_t sz, typename... Args>
+  static constexpr int STRUCT_PACK_INLINE
+  get_fast_varint_width(char (&vec)[sz], const Args &...items) {
+    typename uint_t<get_int_len<parent_tag, Args...>()>::type unsigned_max = 0;
+    typename int_t<get_int_len<parent_tag, Args...>()>::type signed_max = 0;
+    unsigned int i = 0;
+    (get_fast_varint_width_impl<parent_tag>(vec, i, items, unsigned_max,
+                                            signed_max),
+     ...);
+    return get_fast_varint_width_from_max<parent_tag, Args...>(unsigned_max,
+                                                               signed_max);
+  }
+
+  template <uint64_t parent_tag, std::size_t sz, typename Arg>
+  constexpr void STRUCT_PACK_INLINE serialize_one_fast_varint(const Arg &item) {
+    if constexpr (varint_t<Arg, parent_tag>) {
+      if (get_varint_value(item))
+        low_bytes_write_wrapper<(std::min)(sz, sizeof(Arg))>(
+            writer_, get_varint_value(item));
+    }
+  }
+
+  template <uint64_t parent_tag, typename... Args>
+  constexpr void STRUCT_PACK_INLINE
+  serialize_fast_varint(const Args &...items) {
+    constexpr auto cnt = calculate_fast_varint_count<parent_tag, Args...>();
+    constexpr auto bitset_size = ((cnt + 2) + 7) / 8;
+    if constexpr (cnt == 0) {
+      return;
+    }
+    else {
+      char vec[bitset_size]{};
+      auto width = get_fast_varint_width<parent_tag>(vec, items...);
+      vec[cnt / 8] |= (width & 0b1) << (cnt % 8);
+      vec[(cnt + 1) / 8] |= (!!(width & 0b10)) << ((cnt + 1) % 8);
+      write_bytes_array(writer_, vec, bitset_size);
+      switch (width) {
+        case 0:
+          (serialize_one_fast_varint<parent_tag, 1>(items), ...);
+          break;
+        case 1:
+          (serialize_one_fast_varint<parent_tag, 2>(items), ...);
+          break;
+        case 2:
+          (serialize_one_fast_varint<parent_tag, 4>(items), ...);
+          break;
+        case 3:
+          if constexpr (has_64bits_varint<parent_tag, Args...>()) {
+            (serialize_one_fast_varint<parent_tag, 8>(items), ...);
+          }
+          else {
+            unreachable();
+          }
+          break;
+        default:
+          unreachable();
+      }
+    }
+  }
+
+  template <std::size_t size_type, uint64_t version, uint64_t parent_tag = 0,
+            typename T>
   constexpr void inline serialize_one(const T &item) {
     using type = remove_cvref_t<decltype(item)>;
     static_assert(!std::is_pointer_v<type>);
-    constexpr auto id = get_type_id<type>();
+    constexpr auto id = get_type_id<type, parent_tag>();
     if constexpr (is_trivial_view_v<T>) {
       return serialize_one<size_type, version>(item.get());
     }
@@ -157,6 +247,14 @@ class packer {
       }
       else if constexpr (std::is_same_v<type, std::monostate>) {
         // do nothing
+      }
+      else if constexpr (detail::varint_t<type, parent_tag>) {
+        if constexpr (is_enable_fast_varint_coding(parent_tag)) {
+          // do nothing
+        }
+        else {
+          detail::serialize_varint(writer_, item);
+        }
       }
       else if constexpr (std::is_fundamental_v<type> || std::is_enum_v<type> ||
                          id == type_id::int128_t || id == type_id::uint128_t) {
@@ -170,7 +268,7 @@ class packer {
         write_wrapper<sizeof(char)>(writer_, (char *)&has_value);
         if (has_value) {
           if constexpr (is_base_class<typename type::element_type>) {
-            bool is_ok;
+            bool is_ok{};
             uint32_t id = item->get_struct_pack_id();
             auto index = search_type_by_md5<typename type::element_type>(
                 item->get_struct_pack_id(), is_ok);
@@ -187,9 +285,6 @@ class packer {
           }
         }
       }
-      else if constexpr (detail::varint_t<type>) {
-        detail::serialize_varint(writer_, item);
-      }
       else if constexpr (id == type_id::array_t) {
         if constexpr (is_trivial_serializable<type>::value &&
                       is_little_endian_copyable<sizeof(item[0])>) {
@@ -202,43 +297,45 @@ class packer {
         }
       }
       else if constexpr (map_container<type> || container<type>) {
+        auto size = item.size();
         if constexpr (size_type == 1) {
-          uint8_t size = item.size();
-          write_wrapper<size_type>(writer_, (char *)&size);
+          low_bytes_write_wrapper<size_type>(writer_, size);
         }
 #ifdef STRUCT_PACK_OPTIMIZE
         else if constexpr (size_type == 2) {
-          uint16_t size = item.size();
-          write_wrapper<size_type>(writer_, (char *)&size);
+          low_bytes_write_wrapper<size_type>(writer_, size);
         }
         else if constexpr (size_type == 4) {
-          uint32_t size = item.size();
-          write_wrapper<size_type>(writer_, (char *)&size);
+          low_bytes_write_wrapper<size_type>(writer_, size);
         }
         else if constexpr (size_type == 8) {
-          uint64_t size = item.size();
-          write_wrapper<size_type>(writer_, (char *)&size);
+          if constexpr (sizeof(std::size_t) >= 8) {
+            low_bytes_write_wrapper<size_type>(writer_, size);
+          }
+          else {
+            static_assert(!sizeof(T), "illegal size_type");
+          }
         }
         else {
           static_assert(!sizeof(item), "illegal size_type.");
         }
 #else
         else {
-          uint16_t size16;
-          uint32_t size32;
-          uint64_t size64;
+          auto size = item.size();
           switch ((info.metainfo() & 0b11000) >> 3) {
             case 1:
-              size16 = item.size();
-              write_wrapper<2>(writer_, (char *)&size16);
+              low_bytes_write_wrapper<2>(writer_, size);
               break;
             case 2:
-              size32 = item.size();
-              write_wrapper<4>(writer_, (char *)&size32);
+              low_bytes_write_wrapper<4>(writer_, size);
               break;
             case 3:
-              size64 = item.size();
-              write_wrapper<8>(writer_, (char *)&size64);
+              if constexpr (sizeof(std::size_t) >= 8) {
+                low_bytes_write_wrapper<8>(writer_, size);
+              }
+              else {
+                unreachable();
+              }
               break;
             default:
               unreachable();
@@ -314,7 +411,7 @@ class packer {
         else if constexpr ((is_trivial_serializable<type>::value &&
                             !is_little_endian_copyable<sizeof(type)>) ||
                            is_trivial_serializable<type, true>::value) {
-          visit_members(item, [&](auto &&...items) CONSTEXPR_INLINE_LAMBDA {
+          visit_members(item, [this](auto &&...items) CONSTEXPR_INLINE_LAMBDA {
             int i = 1;
             ((serialize_one<size_type, version>(items),
               write_padding(align::padding_size<type>[i++])),
@@ -322,8 +419,19 @@ class packer {
           });
         }
         else {
-          visit_members(item, [&](auto &&...items) CONSTEXPR_INLINE_LAMBDA {
-            serialize_many<size_type, version>(items...);
+          constexpr uint64_t tag = get_parent_tag<type>();
+          if constexpr (is_enable_fast_varint_coding(tag)) {
+            visit_members(
+                item, [this](auto &&...items) CONSTEXPR_INLINE_LAMBDA {
+                  constexpr uint64_t tag =
+                      get_parent_tag<type>();  // to pass msvc with c++17
+                  serialize_fast_varint<tag>(items...);
+                });
+          }
+          visit_members(item, [this](auto &&...items) CONSTEXPR_INLINE_LAMBDA {
+            constexpr uint64_t tag =
+                get_parent_tag<type>();  // to pass msvc with c++17
+            serialize_many<size_type, version, tag>(items...);
           });
         }
       }
@@ -344,7 +452,7 @@ class packer {
       else if constexpr (unique_ptr<type>) {
         if (item != nullptr) {
           if constexpr (is_base_class<typename type::element_type>) {
-            bool is_ok;
+            bool is_ok{};
             auto index = search_type_by_md5<typename type::element_type>(
                 item->get_struct_pack_id(), is_ok);
             assert(is_ok);
@@ -428,30 +536,40 @@ STRUCT_PACK_MAY_INLINE void serialize_to(Writer &writer,
 #endif
   static_assert(sizeof...(args) > 0);
   detail::packer<Writer, detail::get_args_type<Args...>> o(writer, info);
-  switch ((info.metainfo() & 0b11000) >> 3) {
-    case 0:
-      o.template serialize<conf, 1>(args...);
-      break;
+  if constexpr (!check_if_has_container<detail::get_args_type<Args...>>()) {
+    o.template serialize<conf, 1>(args...);
+  }
+  else {
+    switch ((info.metainfo() & 0b11000) >> 3) {
+      case 0:
+        o.template serialize<conf, 1>(args...);
+        break;
 #ifdef STRUCT_PACK_OPTIMIZE
-    case 1:
-      o.template serialize<conf, 2>(args...);
-      break;
-    case 2:
-      o.template serialize<conf, 4>(args...);
-      break;
-    case 3:
-      o.template serialize<conf, 8>(args...);
-      break;
+      case 1:
+        o.template serialize<conf, 2>(args...);
+        break;
+      case 2:
+        o.template serialize<conf, 4>(args...);
+        break;
+      case 3:
+        if constexpr (sizeof(std::size_t) >= 8) {
+          o.template serialize<conf, 8>(args...);
+        }
+        else {
+          unreachable();
+        }
+        break;
 #else
-    case 1:
-    case 2:
-    case 3:
-      o.template serialize<conf, 2>(args...);
-      break;
+      case 1:
+      case 2:
+      case 3:
+        o.template serialize<conf, 2>(args...);
+        break;
 #endif
-    default:
-      detail::unreachable();
-      break;
-  };
+      default:
+        detail::unreachable();
+        break;
+    };
+  }
 }
 }  // namespace struct_pack::detail
