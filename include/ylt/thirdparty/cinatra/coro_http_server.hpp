@@ -10,6 +10,7 @@
 #include "async_simple/coro/Lazy.h"
 #include "cinatra/coro_http_response.hpp"
 #include "cinatra/coro_http_router.hpp"
+#include "cinatra/mime_types.hpp"
 #include "cinatra_log_wrapper.hpp"
 #include "coro_http_connection.hpp"
 #include "ylt/coro_io/coro_io.hpp"
@@ -18,10 +19,14 @@
 namespace cinatra {
 class coro_http_server {
  public:
+  coro_http_server(asio::io_context &ctx, unsigned short port)
+      : out_ctx_(&ctx), port_(port), acceptor_(ctx), check_timer_(ctx) {}
+
   coro_http_server(size_t thread_num, unsigned short port)
-      : pool_(thread_num),
+      : pool_(std::make_unique<coro_io::io_context_pool>(thread_num)),
         port_(port),
-        acceptor_(pool_.get_executor()->get_asio_executor()) {}
+        acceptor_(pool_->get_executor()->get_asio_executor()),
+        check_timer_(pool_->get_executor()->get_asio_executor()) {}
 
   ~coro_http_server() {
     CINATRA_LOG_INFO << "coro_http_server will quit";
@@ -55,9 +60,11 @@ class coro_http_server {
     auto future = promise.getFuture();
 
     if (ec == std::errc{}) {
-      thd_ = std::thread([this] {
-        pool_.run();
-      });
+      if (out_ctx_ == nullptr) {
+        thd_ = std::thread([this] {
+          pool_->run();
+        });
+      }
 
       accept().start([p = std::move(promise)](auto &&res) mutable {
         if (res.hasError()) {
@@ -72,30 +79,41 @@ class coro_http_server {
       promise.setValue(ec);
     }
 
-    return std::move(future);
+    return future;
   }
 
   // only call once, not thread safe.
   void stop() {
-    if (!thd_.joinable()) {
+    if (out_ctx_ == nullptr && !thd_.joinable()) {
       return;
     }
+
+    stop_timer_ = true;
+    std::error_code ec;
+    check_timer_.cancel(ec);
+
     close_acceptor();
 
     // close current connections.
     {
       std::scoped_lock lock(conn_mtx_);
       for (auto &conn : connections_) {
-        conn.second->close();
+        conn.second->close(false);
       }
       connections_.clear();
     }
 
-    CINATRA_LOG_INFO << "wait for server's thread-pool finish all work.";
-    pool_.stop();
-    CINATRA_LOG_INFO << "server's thread-pool finished.";
-    thd_.join();
-    CINATRA_LOG_INFO << "stop coro_http_server ok";
+    if (out_ctx_ == nullptr) {
+      CINATRA_LOG_INFO << "wait for server's thread-pool finish all work.";
+      pool_->stop();
+
+      CINATRA_LOG_INFO << "server's thread-pool finished.";
+      thd_.join();
+      CINATRA_LOG_INFO << "stop coro_http_server ok";
+    }
+    else {
+      out_ctx_ = nullptr;
+    }
   }
 
   // call it after server async_start or sync_start.
@@ -113,6 +131,168 @@ class coro_http_server {
       (coro_http_router::instance().set_http_handler<method>(key, handler),
        ...);
     }
+  }
+
+  template <http_method... method, typename Func>
+  void set_http_handler(std::string key, Func handler, auto owner) {
+    using return_type = typename util::function_traits<Func>::return_type;
+    if constexpr (is_lazy_v<return_type>) {
+      std::function<async_simple::coro::Lazy<void>(coro_http_request & req,
+                                                   coro_http_response & resp)>
+          f = std::bind(handler, owner, std::placeholders::_1,
+                        std::placeholders::_2);
+      set_http_handler<method...>(std::move(key), std::move(f));
+    }
+    else {
+      std::function<void(coro_http_request & req, coro_http_response & resp)>
+          f = std::bind(handler, owner, std::placeholders::_1,
+                        std::placeholders::_2);
+      set_http_handler<method...>(std::move(key), std::move(f));
+    }
+  }
+
+  void set_transfer_chunked_size(size_t size) { chunked_size_ = size; }
+
+  void set_static_res_handler(std::string_view uri_suffix = "",
+                              std::string file_path = "www") {
+    bool has_double_dot = (file_path.find("..") != std::string::npos) ||
+                          (uri_suffix.find("..") != std::string::npos);
+    if (std::filesystem::path(file_path).has_root_path() ||
+        std::filesystem::path(uri_suffix).has_root_path() || has_double_dot) {
+      CINATRA_LOG_ERROR << "invalid file path: " << file_path;
+      std::exit(1);
+    }
+
+    if (!uri_suffix.empty()) {
+      static_dir_router_path_ =
+          std::filesystem::path(uri_suffix).make_preferred().string();
+    }
+
+    if (!file_path.empty()) {
+      static_dir_ = std::filesystem::path(file_path).make_preferred().string();
+    }
+    else {
+      static_dir_ = fs::absolute(fs::current_path().string()).string();
+    }
+
+    files_.clear();
+    for (const auto &file :
+         std::filesystem::recursive_directory_iterator(static_dir_)) {
+      if (!file.is_directory()) {
+        files_.push_back(file.path().string());
+      }
+    }
+
+    std::filesystem::path router_path =
+        std::filesystem::path(static_dir_router_path_);
+
+    std::string uri;
+    for (auto &file : files_) {
+      auto relative_path =
+          std::filesystem::path(file.substr(static_dir_.length())).string();
+      if (size_t pos = relative_path.find('\\') != std::string::npos) {
+        replace_all(relative_path, "\\", "/");
+      }
+      uri = std::string("/")
+                .append(static_dir_router_path_)
+                .append(relative_path);
+
+      set_http_handler<cinatra::GET>(
+          uri,
+          [this, file_name = file](
+              coro_http_request &req,
+              coro_http_response &resp) -> async_simple::coro::Lazy<void> {
+            bool is_ranges = req.is_req_ranges();
+
+            std::string_view extension = get_extension(file_name);
+            std::string_view mime = get_mime_type(extension);
+
+            std::string content;
+            detail::resize(content, chunked_size_);
+
+            coro_io::coro_file in_file{};
+            co_await in_file.async_open(file_name, coro_io::flags::read_only);
+            if (!in_file.is_open()) {
+              resp.set_status_and_content(status_type::not_found,
+                                          file_name + "not found");
+              co_return;
+            }
+
+            if (!is_ranges) {
+              resp.set_format_type(format_type::chunked);
+              bool ok;
+              if (ok = co_await resp.get_conn()->begin_chunked(); !ok) {
+                co_return;
+              }
+
+              while (true) {
+                auto [ec, size] =
+                    co_await in_file.async_read(content.data(), content.size());
+                if (ec) {
+                  resp.set_status(status_type::no_content);
+                  co_await resp.get_conn()->reply();
+                  co_return;
+                }
+
+                bool r = co_await resp.get_conn()->write_chunked(
+                    std::string_view(content.data(), size));
+                if (!r) {
+                  co_return;
+                }
+
+                if (in_file.eof()) {
+                  co_await resp.get_conn()->end_chunked();
+                  break;
+                }
+              }
+            }
+            else {
+              auto range_header = build_range_header(
+                  mime, file_name, coro_io::coro_file::file_size(file_name));
+              resp.set_delay(true);
+              bool r = co_await req.get_conn()->write_data(range_header);
+              if (!r) {
+                co_return;
+              }
+
+              while (true) {
+                auto [ec, size] =
+                    co_await in_file.async_read(content.data(), content.size());
+                if (ec) {
+                  resp.set_status(status_type::no_content);
+                  co_await resp.get_conn()->reply();
+                  co_return;
+                }
+
+                r = co_await req.get_conn()->write_data(
+                    std::string_view(content.data(), size));
+                if (!r) {
+                  co_return;
+                }
+
+                if (in_file.eof()) {
+                  break;
+                }
+              }
+            }
+          });
+    }
+  }
+
+  void set_check_duration(auto duration) { check_duration_ = duration; }
+
+  void set_timeout_duration(
+      std::chrono::steady_clock::duration timeout_duration) {
+    if (timeout_duration > std::chrono::steady_clock::duration::zero()) {
+      need_check_ = true;
+      timeout_duration_ = timeout_duration;
+      start_check_timer();
+    }
+  }
+
+  size_t connection_count() {
+    std::scoped_lock lock(conn_mtx_);
+    return connections_.size();
   }
 
  private:
@@ -151,7 +331,16 @@ class coro_http_server {
 
   async_simple::coro::Lazy<std::errc> accept() {
     for (;;) {
-      auto executor = pool_.get_executor();
+      coro_io::ExecutorWrapper<> *executor;
+      if (out_ctx_ == nullptr) {
+        executor = pool_->get_executor();
+      }
+      else {
+        out_executor_ = std::make_unique<coro_io::ExecutorWrapper<>>(
+            out_ctx_->get_executor());
+        executor = out_executor_.get();
+      }
+
       asio::ip::tcp::socket socket(executor->get_asio_executor());
       auto error = co_await coro_io::async_accept(acceptor_, socket);
       if (error) {
@@ -170,6 +359,9 @@ class coro_http_server {
           std::make_shared<coro_http_connection>(executor, std::move(socket));
       if (no_delay_) {
         conn->tcp_socket().set_option(asio::ip::tcp::no_delay(true));
+      }
+      if (need_check_) {
+        conn->set_check_timeout(true);
       }
 
 #ifdef CINATRA_ENABLE_SSL
@@ -209,8 +401,57 @@ class coro_http_server {
     acceptor_close_waiter_.get_future().wait();
   }
 
+  void start_check_timer() {
+    check_timer_.expires_after(check_duration_);
+    check_timer_.async_wait([this](auto ec) {
+      if (ec || stop_timer_) {
+        return;
+      }
+
+      check_timeout();
+      start_check_timer();
+    });
+  }
+
+  void check_timeout() {
+    auto cur_time = std::chrono::system_clock::now();
+
+    std::unordered_map<uint64_t, std::shared_ptr<coro_http_connection>> conns;
+
+    {
+      std::scoped_lock lock(conn_mtx_);
+      for (auto it = connections_.begin();
+           it != connections_.end();)  // no "++"!
+      {
+        if (cur_time - it->second->get_last_rwtime() > timeout_duration_) {
+          it->second->close(false);
+          connections_.erase(it++);
+        }
+        else {
+          ++it;
+        }
+      }
+    }
+  }
+
+  std::string build_range_header(std::string_view mime,
+                                 std::string_view filename, size_t file_size) {
+    std::string header_str =
+        "HTTP/1.1 200 OK\r\nAccess-Control-Allow-origin: "
+        "*\r\nAccept-Ranges: bytes\r\n";
+    header_str.append("Content-Disposition: attachment;filename=");
+    header_str.append(filename).append("\r\n");
+    header_str.append("Connection: keep-alive\r\n");
+    header_str.append("Content-Type: ").append(mime).append("\r\n");
+    header_str.append("Content-Length: ");
+    header_str.append(std::to_string(file_size)).append("\r\n\r\n");
+    return header_str;
+  }
+
  private:
-  coro_io::io_context_pool pool_;
+  std::unique_ptr<coro_io::io_context_pool> pool_;
+  asio::io_context *out_ctx_ = nullptr;
+  std::unique_ptr<coro_io::ExecutorWrapper<>> out_executor_ = nullptr;
   uint16_t port_;
   asio::ip::tcp::acceptor acceptor_;
   std::thread thd_;
@@ -221,6 +462,17 @@ class coro_http_server {
   std::unordered_map<uint64_t, std::shared_ptr<coro_http_connection>>
       connections_;
   std::mutex conn_mtx_;
+  std::chrono::steady_clock::duration check_duration_ =
+      std::chrono::seconds(15);
+  std::chrono::steady_clock::duration timeout_duration_{};
+  asio::steady_timer check_timer_;
+  bool need_check_ = false;
+  std::atomic<bool> stop_timer_ = false;
+
+  std::string static_dir_router_path_ = "";
+  std::string static_dir_ = "";
+  std::vector<std::string> files_;
+  size_t chunked_size_ = 1024 * 10;
 #ifdef CINATRA_ENABLE_SSL
   std::string cert_file_;
   std::string key_file_;

@@ -17,11 +17,54 @@
 #include <array>
 #include <cstddef>
 #include <string>
+#include <string_view>
 #include <type_traits>
 #include <vector>
 
 #include "marco.h"
+
 namespace struct_pack::detail {
+
+template <typename T>
+constexpr std::string_view get_raw_name() {
+#ifdef _MSC_VER
+  return __FUNCSIG__;
+#else
+  return __PRETTY_FUNCTION__;
+#endif
+}
+
+template <auto T>
+constexpr std::string_view get_raw_name() {
+#ifdef _MSC_VER
+  return __FUNCSIG__;
+#else
+  return __PRETTY_FUNCTION__;
+#endif
+}
+
+template <typename T>
+inline constexpr std::string_view type_string() {
+  constexpr std::string_view sample = get_raw_name<int>();
+  constexpr size_t pos = sample.find("int");
+  constexpr std::string_view str = get_raw_name<T>();
+  constexpr auto next1 = str.rfind(sample[pos + 3]);
+#if defined(_MSC_VER)
+  constexpr std::size_t npos = str.find_first_of(" ", pos);
+  if (npos != std::string_view::npos)
+    return str.substr(npos + 1, next1 - npos - 1);
+  else
+    return str.substr(pos, next1 - pos);
+#else
+  return str.substr(pos, next1 - pos);
+#endif
+}
+
+#if __cpp_concepts >= 201907L
+constexpr bool is_string_reserve_shrink = requires { std::string{}.reserve(); };
+#else
+constexpr bool is_string_reserve_shrink = true;
+#endif
 
 template <typename T>
 using remove_cvref_t = std::remove_cv_t<std::remove_reference_t<T>>;
@@ -134,18 +177,27 @@ template class string_thief<decltype(&std::string::_Mypair),
 
 void string_set_length_hacker(std::string &, std::size_t);
 
+#ifndef __clang__
+#define __has_feature(X) false
+#endif
+
 template <typename ch>
 inline void resize(std::basic_string<ch> &raw_str, std::size_t sz) {
   std::string &str = *reinterpret_cast<std::string *>(&raw_str);
-#if defined(__SANITIZE_ADDRESS__)
+#if defined(__SANITIZE_ADDRESS__) || __has_feature(address_sanitizer)
   raw_str.resize(sz);
 #elif defined(__GLIBCXX__) || defined(_LIBCPP_VERSION) || \
     defined(_MSVC_STL_VERSION)
-  if (sz > str.capacity()) {
-    str.reserve(sz);
+  if constexpr (is_string_reserve_shrink) {
+    if (sz > raw_str.capacity()) {
+      str.reserve(sz * sizeof(ch));
+    }
+  }
+  else {
+    str.reserve(sz * sizeof(ch));
   }
   string_set_length_hacker(str, sz);
-  str[sz] = '\0';
+  for (auto i = sz; i < sz + sizeof(ch); ++i) str[i] = '\0';
 #else
   raw_str.resize(sz);
 #endif
@@ -195,18 +247,22 @@ template class vector_thief<decltype(&std::vector<char>::_Mypair),
 
 template <typename ch>
 inline void resize(std::vector<ch> &raw_vec, std::size_t sz) {
-#if defined(__SANITIZE_ADDRESS__)
+#if defined(__SANITIZE_ADDRESS__) || __has_feature(address_sanitizer)
   raw_vec.resize(sz);
 #elif defined(__GLIBCXX__) ||                                     \
     (defined(_LIBCPP_VERSION) && defined(_LIBCPP_HAS_NO_ASAN)) || \
     defined(_MSVC_STL_VERSION)
   std::vector<char> &vec = *reinterpret_cast<std::vector<char> *>(&raw_vec);
-  vec.reserve(sz);
-  vector_set_length_hacker(vec, sz);
+  vec.reserve(sz * sizeof(ch));
+  vector_set_length_hacker(vec, sz * sizeof(ch));
 #else
   raw_vec.resize(sz);
 #endif
 }
+#endif
+
+#ifndef __clang__
+#undef __has_feature
 #endif
 
 template <typename T>

@@ -28,8 +28,10 @@
 #include <asio/dispatch.hpp>
 #include <asio/ip/tcp.hpp>
 #include <asio/read.hpp>
+#include <asio/read_at.hpp>
 #include <asio/read_until.hpp>
 #include <asio/write.hpp>
+#include <asio/write_at.hpp>
 #include <chrono>
 #include <deque>
 
@@ -136,6 +138,18 @@ async_read_some(Socket &socket, AsioBuffer &&buffer) noexcept {
 }
 
 template <typename Socket, typename AsioBuffer>
+inline async_simple::coro::Lazy<std::pair<std::error_code, size_t>>
+async_read_at(uint64_t offset, Socket &socket, AsioBuffer &&buffer) noexcept {
+  callback_awaitor<std::pair<std::error_code, size_t>> awaitor;
+  co_return co_await awaitor.await_resume([&](auto handler) {
+    asio::async_read_at(socket, offset, buffer,
+                        [&, handler](const auto &ec, auto size) {
+                          handler.set_value_then_resume(ec, size);
+                        });
+  });
+}
+
+template <typename Socket, typename AsioBuffer>
 inline async_simple::coro::Lazy<std::pair<std::error_code, size_t>> async_read(
     Socket &socket, AsioBuffer &&buffer) noexcept {
   callback_awaitor<std::pair<std::error_code, size_t>> awaitor;
@@ -190,6 +204,18 @@ async_write_some(Socket &socket, AsioBuffer &&buffer) noexcept {
     socket.async_write_some(buffer, [&, handler](const auto &ec, auto size) {
       handler.set_value_then_resume(ec, size);
     });
+  });
+}
+
+template <typename Socket, typename AsioBuffer>
+inline async_simple::coro::Lazy<std::pair<std::error_code, size_t>>
+async_write_at(uint64_t offset, Socket &socket, AsioBuffer &&buffer) noexcept {
+  callback_awaitor<std::pair<std::error_code, size_t>> awaitor;
+  co_return co_await awaitor.await_resume([&](auto handler) {
+    asio::async_write_at(socket, offset, buffer,
+                         [&, handler](const auto &ec, auto size) {
+                           handler.set_value_then_resume(ec, size);
+                         });
   });
 }
 

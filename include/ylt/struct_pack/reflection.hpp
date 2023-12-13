@@ -36,6 +36,10 @@
 #include "marco.h"
 #include "util.h"
 
+#if __cpp_concepts >= 201907L
+#include <concepts>
+#endif
+
 namespace struct_pack {
 
 enum sp_config : uint64_t {
@@ -106,11 +110,6 @@ concept view_reader_t = reader_t<T> && requires(T t) {
   { t.read_view(std::size_t{}) } -> std::convertible_to<const char *>;
 };
 
-template <typename T>
-concept seek_reader_t = reader_t<T> && requires(T t) {
-  t.seekg(std::size_t{});
-};
-
 #else
 
 template <typename T, typename = void>
@@ -147,17 +146,43 @@ struct view_reader_t_impl<
 
 template <typename T>
 constexpr bool view_reader_t = reader_t<T> &&view_reader_t_impl<T>::value;
+#endif
 
-template <typename T, typename = void>
-struct seek_reader_t_impl : std::false_type {};
+#if __cpp_concepts >= 201907L
 
 template <typename T>
-struct seek_reader_t_impl<
-    T, std::void_t<decltype(std::declval<T>().seekg(std::size_t{}))>>
+concept can_reserve = requires(T t) {
+  t.reserve(std::size_t{});
+};
+
+template <typename T>
+concept can_shrink_to_fit = requires(T t) {
+  t.shrink_to_fit();
+};
+
+#else
+
+template <typename T, typename = void>
+struct can_reserve_impl : std::false_type {};
+
+template <typename T>
+struct can_reserve_impl<
+    T, std::void_t<decltype(std::declval<T>().reserve(std::size_t{}))>>
     : std::true_type {};
 
 template <typename T>
-constexpr bool seek_reader_t = reader_t<T> &&seek_reader_t_impl<T>::value;
+constexpr bool can_reserve = can_reserve_impl<T>::value;
+
+template <typename T, typename = void>
+struct can_shrink_to_fit_impl : std::false_type {};
+
+template <typename T>
+struct can_shrink_to_fit_impl<
+    T, std::void_t<decltype(std::declval<T>().shrink_to_fit())>>
+    : std::true_type {};
+
+template <typename T>
+constexpr bool can_shrink_to_fit = can_shrink_to_fit_impl<T>::value;
 
 #endif
 
@@ -577,6 +602,46 @@ template <typename T, typename = void>
   constexpr bool user_defined_config = user_defined_config_impl<T>::value;
 #endif
 
+struct memory_reader;
+
+#if __cpp_concepts >= 201907L
+  template <typename Type>
+  concept user_defined_serialization = requires (Type& t) {
+    sp_serialize_to(std::declval<struct_pack::detail::memory_writer&>(),(const Type&)t);
+    {sp_deserialize_to(std::declval<struct_pack::detail::memory_reader&>(),t)} -> std::same_as<struct_pack::errc>;
+    {sp_get_needed_size((const Type&)t)}->std::same_as<std::size_t>;
+  };
+  template <typename Type>
+  concept user_defined_type_name = requires {
+    { sp_set_type_name((Type*)nullptr) } -> std::same_as<std::string_view>;
+  };
+#else
+
+  template <typename T, typename = void>
+  struct user_defined_serialization_impl : std::false_type {};
+
+  template <typename T>
+  struct user_defined_serialization_impl<T, std::void_t<
+    decltype(sp_serialize_to(std::declval<struct_pack::detail::memory_writer&>(),std::declval<const T&>())),
+    std::enable_if<std::is_same_v<decltype(sp_deserialize_to(std::declval<struct_pack::detail::memory_reader&>(),std::declval<T&>())), struct_pack::errc>,
+    std::enable_if<std::is_same_v<decltype(sp_get_needed_size(std::declval<const T&>())), std::string_view>>>>>
+      : std::true_type {};
+
+  template <typename Type>
+  constexpr bool user_defined_serialization = user_defined_serialization_impl<Type>::value;
+
+  template <typename T, typename = void>
+  struct user_defined_type_name_impl : std::false_type {};
+
+  template <typename T>
+  struct user_defined_type_name_impl<T, std::void_t<
+    std::enable_if<std::is_same_v<decltype(sp_set_type_name((T*)nullptr)), std::string_view>>>>
+      : std::true_type {};
+
+  template <typename Type>
+  constexpr bool user_defined_type_name = user_defined_type_name_impl<Type>::value;
+#endif
+
 #if __cpp_concepts >= 201907L
   template <typename Type>
   concept tuple_size = requires(Type tuple) {
@@ -773,7 +838,10 @@ template <typename T, typename = void>
                     ...);
       }
       static constexpr bool solve() {
-        if constexpr (std::is_same_v<T,std::monostate>) {
+        if constexpr (user_defined_serialization<T>) {
+          return false;
+        }
+        else if constexpr (std::is_same_v<T,std::monostate>) {
           return true;
         }
         else if constexpr (std::is_abstract_v<T>) {
@@ -2181,6 +2249,26 @@ constexpr decltype(auto) STRUCT_PACK_INLINE template_switch(std::size_t index,
   }
 }  // namespace detail
 }  // namespace detail
+#if __cpp_concepts >= 201907L
+
+template <typename T>
+concept checkable_reader_t = reader_t<T> && requires(T t) {
+  t.check(std::size_t{});
+};
+
+#else
+
+template <typename T, typename = void>
+struct checkable_reader_t_impl : std::false_type {};
+
+template <typename T>
+struct checkable_reader_t_impl<
+    T, std::void_t<decltype(std::declval<T>().check(std::size_t{}))>>
+    : std::true_type {};
+
+template <typename T>
+constexpr bool checkable_reader_t = reader_t<T> &&checkable_reader_t_impl<T>::value;
+#endif
 }  // namespace struct_pack
 
 // clang-format off
