@@ -13,10 +13,15 @@
 #include "cinatra/mime_types.hpp"
 #include "cinatra_log_wrapper.hpp"
 #include "coro_http_connection.hpp"
+#include "ylt/coro_io/coro_file.hpp"
 #include "ylt/coro_io/coro_io.hpp"
 #include "ylt/coro_io/io_context_pool.hpp"
 
 namespace cinatra {
+enum class file_resp_format_type {
+  chunked,
+  range,
+};
 class coro_http_server {
  public:
   coro_http_server(asio::io_context &ctx, unsigned short port)
@@ -151,10 +156,39 @@ class coro_http_server {
     }
   }
 
+  void set_max_size_of_cache_files(size_t max_size = 3 * 1024 * 1024) {
+    std::error_code ec;
+    for (const auto &file :
+         std::filesystem::recursive_directory_iterator(static_dir_, ec)) {
+      if (ec) {
+        continue;
+      }
+
+      if (!file.is_directory()) {
+        size_t filesize = fs::file_size(file, ec);
+        if (ec || filesize > max_size) {
+          continue;
+        }
+
+        std::ifstream ifs(file.path(), std::ios::binary);
+        if (ifs.is_open()) {
+          std::string content;
+          detail::resize(content, filesize);
+          ifs.read(content.data(), content.size());
+          static_file_cache_.emplace(file.path().string(), std::move(content));
+        }
+      }
+    }
+  }
+
+  void set_file_resp_format_type(file_resp_format_type type) {
+    format_type_ = type;
+  }
+
   void set_transfer_chunked_size(size_t size) { chunked_size_ = size; }
 
-  void set_static_res_handler(std::string_view uri_suffix = "",
-                              std::string file_path = "www") {
+  void set_static_res_dir(std::string_view uri_suffix = "",
+                          std::string file_path = "www") {
     bool has_double_dot = (file_path.find("..") != std::string::npos) ||
                           (uri_suffix.find("..") != std::string::npos);
     if (std::filesystem::path(file_path).has_root_path() ||
@@ -193,19 +227,35 @@ class coro_http_server {
       if (size_t pos = relative_path.find('\\') != std::string::npos) {
         replace_all(relative_path, "\\", "/");
       }
-      uri = std::string("/")
-                .append(static_dir_router_path_)
-                .append(relative_path);
+      if (static_dir_router_path_.empty()) {
+        uri = relative_path;
+      }
+      else {
+        uri = fs::path("/")
+                  .append(static_dir_router_path_)
+                  .concat(relative_path)
+                  .string();
+      }
 
       set_http_handler<cinatra::GET>(
           uri,
           [this, file_name = file](
               coro_http_request &req,
               coro_http_response &resp) -> async_simple::coro::Lazy<void> {
-            bool is_ranges = req.is_req_ranges();
-
             std::string_view extension = get_extension(file_name);
             std::string_view mime = get_mime_type(extension);
+
+            if (auto it = static_file_cache_.find(file_name);
+                it != static_file_cache_.end()) {
+              auto range_header =
+                  build_range_header(mime, file_name, fs::file_size(file_name));
+              resp.set_delay(true);
+              std::string &body = it->second;
+              std::array<asio::const_buffer, 2> arr{asio::buffer(range_header),
+                                                    asio::buffer(body)};
+              co_await req.get_conn()->async_write(arr);
+              co_return;
+            }
 
             std::string content;
             detail::resize(content, chunked_size_);
@@ -218,7 +268,7 @@ class coro_http_server {
               co_return;
             }
 
-            if (!is_ranges) {
+            if (format_type_ == file_resp_format_type::chunked) {
               resp.set_format_type(format_type::chunked);
               bool ok;
               if (ok = co_await resp.get_conn()->begin_chunked(); !ok) {
@@ -473,6 +523,9 @@ class coro_http_server {
   std::string static_dir_ = "";
   std::vector<std::string> files_;
   size_t chunked_size_ = 1024 * 10;
+
+  std::unordered_map<std::string, std::string> static_file_cache_;
+  file_resp_format_type format_type_ = file_resp_format_type::chunked;
 #ifdef CINATRA_ENABLE_SSL
   std::string cert_file_;
   std::string key_file_;
