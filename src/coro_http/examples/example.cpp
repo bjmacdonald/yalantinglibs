@@ -19,173 +19,156 @@
 #include "ylt/coro_http/coro_http_server.hpp"
 
 using namespace std::chrono_literals;
+using namespace coro_http;
 
-void test_sync_client() {
+void create_file(std::string filename, size_t file_size = 64) {
+  std::ofstream file(filename, std::ios::binary);
+  if (file) {
+    std::string str(file_size, 'A');
+    file.write(str.data(), str.size());
+  }
+}
+
+async_simple::coro::Lazy<void> byte_ranges_download() {
+  create_file("test_multiple_range.txt", 64);
+  coro_http_server server(1, 8090);
+  server.set_static_res_dir("", "");
+  server.async_start();
+  std::this_thread::sleep_for(200ms);
+
+  std::string uri = "http://127.0.0.1:8090/test_multiple_range.txt";
   {
-    std::string uri = "http://www.baidu.com";
-    coro_http::coro_http_client client{};
-    auto result = client.get(uri);
-    if (result.net_err) {
-      std::cout << result.net_err.message() << "\n";
-    }
-    std::cout << result.status << "\n";
-    std::cout << result.resp_body << "\n";
+    std::string filename = "test1.txt";
+    std::error_code ec{};
+    std::filesystem::remove(filename, ec);
 
-    result = client.post(uri, "hello", coro_http::req_content_type::json);
-    std::cout << result.status << "\n";
+    coro_http_client client{};
+    resp_data result = co_await client.async_download(uri, filename, "1-10");
+    assert(result.status == 206);
+    assert(std::filesystem::file_size(filename) == 10);
+
+    filename = "test2.txt";
+    std::filesystem::remove(filename, ec);
+    result = co_await client.async_download(uri, filename, "10-15");
+    assert(result.status == 206);
+    assert(std::filesystem::file_size(filename) == 6);
   }
 
   {
-    coro_http::coro_http_client client{};
-    std::string uri = "http://cn.bing.com";
-    auto result = client.get(uri);
-    if (result.net_err) {
-      std::cout << result.net_err.message() << "\n";
-    }
-    std::cout << result.status << "\n";
+    coro_http_client client{};
+    std::string uri = "http://127.0.0.1:8090/test_multiple_range.txt";
 
-    result = client.post(uri, "hello", coro_http::req_content_type::json);
-    std::cout << result.status << "\n";
+    client.add_header("Range", "bytes=1-10,20-30");
+    auto result = co_await client.async_get(uri);
+    assert(result.status == 206);
+    assert(result.resp_body.size() == 21);
+
+    std::string filename = "test_ranges.txt";
+    client.add_header("Range", "bytes=0-10,21-30");
+    result = co_await client.async_download(uri, filename);
+    assert(result.status == 206);
+    assert(fs::file_size(filename) == 21);
   }
 }
 
-async_simple::coro::Lazy<void> test_async_client(
-    coro_http::coro_http_client &client) {
-  std::string uri = "http://www.baidu.com";
+async_simple::coro::Lazy<resp_data> chunked_upload1(coro_http_client &client) {
+  std::string filename = "test.txt";
+  create_file(filename, 1010);
 
-  auto result = co_await client.connect(uri);
-  if (result.net_err) {
-    std::cout << result.net_err.message() << "\n";
-  }
-  std::cout << result.status << "\n";
+  coro_io::coro_file file{};
+  co_await file.async_open(filename, coro_io::flags::read_only);
 
-  result = co_await client.async_get(uri);
-  if (result.net_err) {
-    std::cout << result.net_err.message() << "\n";
-  }
-  std::cout << result.status << "\n";
+  std::string buf;
+  detail::resize(buf, 100);
 
-  result = co_await client.async_get(uri);
-  std::cout << result.status << "\n";
+  auto fn = [&file, &buf]() -> async_simple::coro::Lazy<read_result> {
+    auto [ec, size] = co_await file.async_read(buf.data(), buf.size());
+    co_return read_result{buf, file.eof(), ec};
+  };
 
-  result = co_await client.async_post(uri, "hello",
-                                      coro_http::req_content_type::string);
-  std::cout << result.status << "\n";
+  auto result = co_await client.async_upload_chunked(
+      "http://127.0.0.1:9001/chunked"sv, http_method::POST, std::move(fn));
+  co_return result;
 }
 
-async_simple::coro::Lazy<void> test_async_ssl_client(
-    coro_http::coro_http_client &client) {
-#ifdef CINATRA_ENABLE_SSL
-  std::string uri = "https://cn.bing.com";
-  [[maybe_unused]] auto ec = client.init_ssl("cn.bing.com");
-  auto data = co_await client.async_get(uri);
-  std::cout << data.net_err.message() << "\n";
-  std::cout << data.status << std::endl;
-#endif
-  co_return;
-}
-
-async_simple::coro::Lazy<void> test_websocket(
-    coro_http::coro_http_client &client) {
-  client.on_ws_close([](std::string_view reason) {
-    std::cout << "web socket close " << reason << std::endl;
-  });
-  client.on_ws_msg([](coro_http::resp_data data) {
-    if (data.net_err) {
-      std::cout << data.net_err.message() << "\n";
-      return;
-    }
-
-    std::cout << data.resp_body << std::endl;
-  });
-
-  // connect to your websocket server.
-  bool r = co_await client.async_ws_connect("ws://localhost:8090/ws");
-  if (!r) {
-    co_return;
-  }
-
-  auto result = co_await client.async_send_ws("hello websocket");
-  std::cout << result.net_err << "\n";
-  result = co_await client.async_send_ws("test again", /*need_mask = */ false);
-  std::cout << result.net_err << "\n";
-  result = co_await client.async_send_ws_close("ws close");
-  std::cout << result.net_err << "\n";
-}
-
-async_simple::coro::Lazy<void> upload_files(
-    coro_http::coro_http_client &client) {
-  client.add_str_part("hello", "world");
-  client.add_str_part("key", "value");
-  client.add_file_part("test", "test.jpg");
-  std::string uri = "http://yoururl.com";
-  auto result = co_await client.async_upload_multipart(uri);
-  std::cout << result.net_err << "\n";
-  std::cout << result.status << "\n";
-
-  result = co_await client.async_upload_multipart(uri, "test", "test.jpg");
-  std::cout << result.status << "\n";
-}
-
-async_simple::coro::Lazy<void> download_files(
-    coro_http::coro_http_client &client) {
-  auto result = co_await client.async_download("http://example.com/test.jpg",
-                                               "myfile.jpg");
-  std::cout << result.status << "\n";
-}
-
-async_simple::coro::Lazy<void> ranges_download_files(
-    coro_http::coro_http_client &client) {
-  auto result = co_await client.async_download("http://example.com/test.txt",
-                                               "myfile.txt", "1-10,11-16");
-  std::cout << result.status << "\n";
-}
-
-void use_out_buf() {
-  using namespace coro_http;
-  std::string str;
-  str.resize(10);
-  std::string url = "http://cn.bing.com";
-
-  str.resize(16400);
-  coro_http_client client;
-  auto ret = client.async_request(url, http_method::GET, req_context<>{}, {},
-                                  std::span<char>{str.data(), str.size()});
-  auto result = async_simple::coro::syncAwait(ret);
-  bool ok = result.status == 200 || result.status == 301;
-  assert(ok);
-  std::string_view sv(str.data(), result.resp_body.size());
-  assert(result.resp_body == sv);
-}
-
-void test_coro_http_server() {
-  using namespace coro_http;
-  coro_http::coro_http_server server(1, 9001);
-  server.set_http_handler<coro_http::GET, coro_http::POST>(
-      "/", [](coro_http_request &req, coro_http_response &resp) {
-        // response in io thread.
-        resp.set_status_and_content(coro_http::status_type::ok, "hello world");
-      });
-
-  server.set_http_handler<coro_http::GET, coro_http::POST>(
-      "/coro",
+async_simple::coro::Lazy<void> chunked_upload_download() {
+  coro_http_server server(1, 9001);
+  server.set_http_handler<GET, POST>(
+      "/chunked",
       [](coro_http_request &req,
          coro_http_response &resp) -> async_simple::coro::Lazy<void> {
-        co_await coro_io::post([&]() {
-          // coroutine in other thread.
-          resp.set_status_and_content(coro_http::status_type::ok,
-                                      "hello world in coro");
-        });
+        assert(req.get_content_type() == content_type::chunked);
+        chunked_result result{};
+        std::string content;
+
+        while (true) {
+          result = co_await req.get_conn()->read_chunked();
+          if (result.ec) {
+            co_return;
+          }
+          if (result.eof) {
+            break;
+          }
+
+          content.append(result.data);
+        }
+
+        std::cout << "content size: " << content.size() << "\n";
+        std::cout << content << "\n";
+        resp.set_format_type(format_type::chunked);
+        resp.set_status_and_content(status_type::ok, "chunked ok");
       });
 
-  server.set_http_handler<cinatra::GET>(
-      "/ws_source",
+  server.set_http_handler<GET, POST>(
+      "/write_chunked",
+      [](coro_http_request &req,
+         coro_http_response &resp) -> async_simple::coro::Lazy<void> {
+        resp.set_format_type(format_type::chunked);
+        bool ok;
+        if (ok = co_await resp.get_conn()->begin_chunked(); !ok) {
+          co_return;
+        }
+
+        std::vector<std::string> vec{"hello", " world", " ok"};
+
+        for (auto &str : vec) {
+          if (ok = co_await resp.get_conn()->write_chunked(str); !ok) {
+            co_return;
+          }
+        }
+
+        ok = co_await resp.get_conn()->end_chunked();
+      });
+
+  server.async_start();
+  std::this_thread::sleep_for(200ms);
+
+  coro_http_client client{};
+  auto r = co_await chunked_upload1(client);
+  assert(r.status == 200);
+  assert(r.resp_body == "chunked ok");
+
+  auto ss = std::make_shared<std::stringstream>();
+  *ss << "hello world";
+  auto result = co_await client.async_upload_chunked(
+      "http://127.0.0.1:9001/chunked"sv, http_method::POST, ss);
+  assert(result.status == 200);
+  assert(result.resp_body == "chunked ok");
+
+  result = co_await client.async_get("http://127.0.0.1:9001/write_chunked");
+  assert(result.status == 200);
+  assert(result.resp_body == "hello world ok");
+}
+
+async_simple::coro::Lazy<void> use_websocket() {
+  coro_http_server server(1, 9001);
+  server.set_http_handler<GET>(
+      "/ws_echo",
       [](coro_http_request &req,
          coro_http_response &resp) -> async_simple::coro::Lazy<void> {
         assert(req.get_content_type() == content_type::websocket);
-        std::string out_str;
         websocket_result result{};
-        while (!result.eof) {
+        while (true) {
           result = co_await req.get_conn()->read_websocket();
           if (result.ec) {
             break;
@@ -196,54 +179,238 @@ void test_coro_http_server() {
             break;
           }
 
-          out_str.append(result.data);
+          if (result.type == ws_frame_type::WS_TEXT_FRAME ||
+              result.type == ws_frame_type::WS_BINARY_FRAME) {
+            std::cout << result.data << "\n";
+          }
+
+          if (result.type == ws_frame_type::WS_PING_FRAME ||
+              result.type == ws_frame_type::WS_PONG_FRAME) {
+            // ping pong frame just need to continue, no need echo anything,
+            // because framework has reply ping/pong msg to client
+            // automatically.
+            continue;
+          }
+          else {
+            // error frame
+            break;
+          }
 
           auto ec = co_await req.get_conn()->write_websocket(result.data);
           if (ec) {
-            continue;
+            break;
           }
         }
-
-        std::cout << out_str << "\n";
       });
-
   server.async_start();
-  std::this_thread::sleep_for(200ms);
+  std::this_thread::sleep_for(300ms);  // wait for server start
 
   coro_http_client client{};
-  resp_data result;
-  result = client.get("http://127.0.0.1:9001/");
-  assert(result.status == 200);
-  assert(result.resp_body == "hello world");
+  client.on_ws_close([](std::string_view reason) {
+    std::cout << reason << "\n";
+    assert(reason == "normal close");
+  });
+  client.on_ws_msg([](resp_data data) {
+    if (data.net_err) {
+      std::cout << data.net_err.message() << "\n";
+      return;
+    }
+    assert(data.resp_body == "hello websocket" ||
+           data.resp_body == "test again");
+  });
 
-  result = client.get("http://127.0.0.1:9001/coro");
+  bool r = co_await client.async_ws_connect("ws://127.0.0.1:9001/ws_echo");
+  if (!r) {
+    co_return;
+  }
+
+  auto result =
+      co_await client.async_send_ws("hello websocket");  // mask as default.
+  assert(!result.net_err);
+  result = co_await client.async_send_ws("test again", /*need_mask = */ false);
+  assert(!result.net_err);
+}
+
+async_simple::coro::Lazy<void> static_file_server() {
+  std::string filename = "temp.txt";
+  create_file(filename, 64);
+
+  coro_http_server server(1, 9001);
+
+  std::string virtual_path = "download";
+  std::string files_root_path = "";  // current path
+  server.set_static_res_dir(
+      virtual_path,
+      files_root_path);  // set this before server start, if you add new files,
+                         // you need restart the server.
+  server.async_start();
+  std::this_thread::sleep_for(300ms);  // wait for server start
+
+  coro_http_client client{};
+  auto result =
+      co_await client.async_get("http://127.0.0.1:9001/download/temp.txt");
   assert(result.status == 200);
-  assert(result.resp_body == "hello world in coro");
+  assert(result.resp_body.size() == 64);
+}
+
+struct log_t : public base_aspect {
+  bool before(coro_http_request &, coro_http_response &) {
+    std::cout << "before log" << std::endl;
+    return true;
+  }
+
+  bool after(coro_http_request &, coro_http_response &res) {
+    std::cout << "after log" << std::endl;
+    res.add_header("aaaa", "bbcc");
+    return true;
+  }
+};
+
+struct get_data : public base_aspect {
+  bool before(coro_http_request &req, coro_http_response &res) {
+    req.set_aspect_data("hello", std::string("hello world"));
+    return true;
+  }
+};
+
+async_simple::coro::Lazy<void> use_aspects() {
+  coro_http_server server(1, 9001);
+  server.set_http_handler<GET>(
+      "/get",
+      [](coro_http_request &req, coro_http_response &resp) {
+        std::optional<std::string> val =
+            req.get_aspect_data<std::string>("hello");
+        assert(*val == "hello world");
+        resp.set_status_and_content(status_type::ok, "ok");
+      },
+      std::vector<std::shared_ptr<base_aspect>>{std::make_shared<log_t>(),
+                                                std::make_shared<get_data>()});
+
+  server.async_start();
+  std::this_thread::sleep_for(300ms);  // wait for server start
+
+  coro_http_client client{};
+  auto result = co_await client.async_get("http://127.0.0.1:9001/get");
+  assert(result.status == 200);
+
+  co_return;
+}
+
+struct person_t {
+  void foo(coro_http_request &, coro_http_response &res) {
+    res.set_status_and_content(status_type::ok, "ok");
+  }
+};
+
+async_simple::coro::Lazy<void> basic_usage() {
+  coro_http_server server(1, 9001);
+  server.set_http_handler<GET>(
+      "/get", [](coro_http_request &req, coro_http_response &resp) {
+        resp.set_status_and_content(status_type::ok, "ok");
+      });
+
+  server.set_http_handler<GET>(
+      "/coro",
+      [](coro_http_request &req,
+         coro_http_response &resp) -> async_simple::coro::Lazy<void> {
+        resp.set_status_and_content(status_type::ok, "ok");
+        co_return;
+      });
+
+  server.set_http_handler<GET>(
+      "/in_thread_pool",
+      [](coro_http_request &req,
+         coro_http_response &resp) -> async_simple::coro::Lazy<void> {
+        // will respose in another thread.
+        co_await coro_io::post([&] {
+          // do your heavy work here when finished work, response.
+          resp.set_status_and_content(status_type::ok, "ok");
+        });
+      });
+
+  server.set_http_handler<POST, PUT>(
+      "/post", [](coro_http_request &req, coro_http_response &resp) {
+        auto req_body = req.get_body();
+        resp.set_status_and_content(status_type::ok, std::string{req_body});
+      });
+
+  server.set_http_handler<GET>(
+      "/headers", [](coro_http_request &req, coro_http_response &resp) {
+        auto name = req.get_header_value("name");
+        auto age = req.get_header_value("age");
+        assert(name == "tom");
+        assert(age == "20");
+        resp.set_status_and_content(status_type::ok, "ok");
+      });
+
+  server.set_http_handler<GET>(
+      "/query", [](coro_http_request &req, coro_http_response &resp) {
+        auto name = req.get_query_value("name");
+        auto age = req.get_query_value("age");
+        assert(name == "tom");
+        assert(age == "20");
+        resp.set_status_and_content(status_type::ok, "ok");
+      });
+
+  server.set_http_handler<GET, POST>(
+      "/users/:userid/subscriptions/:subid",
+      [](coro_http_request &req, coro_http_response &response) {
+        assert(req.params_["userid"] == "ultramarines");
+        assert(req.params_["subid"] == "guilliman");
+        response.set_status_and_content(status_type::ok, "ok");
+      });
+
+  person_t person{};
+  server.set_http_handler<GET>("/person", &person_t::foo, person);
+
+  server.async_start();
+  std::this_thread::sleep_for(300ms);  // wait for server start
+
+  coro_http_client client{};
+  auto result = co_await client.async_get("http://127.0.0.1:9001/get");
+  assert(result.status == 200);
+  assert(result.resp_body == "ok");
+  for (auto [key, val] : result.resp_headers) {
+    std::cout << key << ": " << val << "\n";
+  }
+
+  result = co_await client.async_get("/coro");
+  assert(result.status == 200);
+
+  result = co_await client.async_get("/in_thread_pool");
+  assert(result.status == 200);
+
+  result = co_await client.async_post("/post", "post string",
+                                      req_content_type::string);
+  assert(result.status == 200);
+  assert(result.resp_body == "post string");
+
+  client.add_header("name", "tom");
+  client.add_header("age", "20");
+  result = co_await client.async_get("/headers");
+  assert(result.status == 200);
+
+  result = co_await client.async_get("/query?name=tom&age=20");
+  assert(result.status == 200);
+
+  result = co_await client.async_get(
+      "http://127.0.0.1:9001/users/ultramarines/subscriptions/guilliman");
+  assert(result.status == 200);
+
+  // make sure you have install openssl and enable CINATRA_ENABLE_SSL
+#ifdef CINATRA_ENABLE_SSL
+  coro_http_client client2{};
+  result = co_await client2.async_get("https://baidu.com");
+  assert(result.status == 200);
+#endif
 }
 
 int main() {
-  test_coro_http_server();
-  test_sync_client();
-  use_out_buf();
-
-  coro_http::coro_http_client client{};
-  async_simple::coro::syncAwait(test_async_client(client));
-
-  coro_http::coro_http_client ssl_client{};
-  async_simple::coro::syncAwait(test_async_ssl_client(ssl_client));
-
-  coro_http::coro_http_client ws_client{};
-  async_simple::coro::syncAwait(test_websocket(ws_client));
-
-  coro_http::coro_http_client upload_client{};
-  upload_client.set_req_timeout(std::chrono::seconds(3));
-  async_simple::coro::syncAwait(upload_files(upload_client));
-
-  coro_http::coro_http_client download_client{};
-  download_client.set_req_timeout(std::chrono::seconds(3));
-  async_simple::coro::syncAwait(download_files(download_client));
-
-  coro_http::coro_http_client ranges_download_client{};
-  ranges_download_client.set_req_timeout(std::chrono::seconds(3));
-  async_simple::coro::syncAwait(ranges_download_files(ranges_download_client));
+  async_simple::coro::syncAwait(basic_usage());
+  async_simple::coro::syncAwait(use_aspects());
+  async_simple::coro::syncAwait(static_file_server());
+  async_simple::coro::syncAwait(use_websocket());
+  async_simple::coro::syncAwait(chunked_upload_download());
+  async_simple::coro::syncAwait(byte_ranges_download());
+  return 0;
 }

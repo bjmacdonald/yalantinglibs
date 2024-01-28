@@ -23,13 +23,10 @@
 #include <atomic>
 #include <cstdint>
 #include <functional>
-#include <future>
 #include <memory>
 #include <string_view>
 #include <system_error>
 #include <utility>
-#include <variant>
-#include <vector>
 #include <ylt/easylog.hpp>
 
 #include "ylt/coro_io/coro_io.hpp"
@@ -318,8 +315,8 @@ class coro_connection : public std::enable_shared_from_this<coro_connection> {
       return {};
     };
     std::string body_buf;
-    std::string header_buf =
-        rpc_protocol::prepare_response(body_buf, req_head, 0, ec, error_msg);
+    std::string header_buf = rpc_protocol::prepare_response(
+        body_buf, req_head, 0, ec, error_msg, true);
     response(std::move(header_buf), std::move(body_buf), std::move(attach_ment),
              shared_from_this(), is_delay)
         .via(executor_)
@@ -359,12 +356,8 @@ class coro_connection : public std::enable_shared_from_this<coro_connection> {
     conn_id_ = conn_id;
   }
 
-  template <typename T>
-  void set_tag(T &&tag) {
-    tag_ = std::forward<T>(tag);
-  }
-
-  std::any get_tag() { return tag_; }
+  std::any &tag() { return tag_; }
+  const std::any &tag() const { return tag_; }
 
   auto &get_executor() { return *executor_; }
 

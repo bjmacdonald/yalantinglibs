@@ -174,7 +174,7 @@ struct_pack是一个基于编译期反射，易用且高性能的序列化库，
 
 [(Video)  A Faster Serialization Library Based on Compile-time Reflection and C++20](https://www.youtube.com/watch?v=myhB8ZlwOlE) CppCon2022 的演讲视频。
 
-[(Slides) 基于编译期反射和模板元编程的序列化库：struct_pack简介](https://alibaba.github.io/yalantinglibs/resource/struct_pack_introduce_CN.pdf) Purecpp的演讲稿。
+[(Slides) 基于编译期反射和模板元编程的序列化库：struct_pack简介](https://alibaba.github.io/yalantinglibs/resource/CppSummit_struct_pack.pdf) Purecpp的演讲稿。
 
 [(Video) 基于编译期反射和模板元编程的序列化库：struct_pack简介](https://live.csdn.net/room/csdnlive1/bKFbKP7T) Purecpp的演讲视频, 从 01:32:20 开始
 
@@ -258,12 +258,39 @@ void basic_usage() {
 
 ## coro_http
 
-coro_http 是一个 C++20 的协程http(https)客户端, 支持: get/post, websocket, multipart file , chunked 和 ranges 请求。
+coro_http 是一个 C++20 的协程http(https)库，包括服务端和客户端, 支持: get/post, websocket, multipart file , chunked 和 ranges 请求。[more examples](https://github.com/alibaba/yalantinglibs/blob/main/src/coro_http/examples/example.cpp)
 
 ### get/post
 ```cpp
+#include "ylt/coro_http/coro_http_server.hpp"
 #include "ylt/coro_http/coro_http_client.hpp"
 using namespace ylt;
+
+async_simple::coro::Lazy<void> basic_usage() {
+  coro_http_server server(1, 9001);
+  server.set_http_handler<GET>(
+      "/get", [](coro_http_request &req, coro_http_response &resp) {
+        resp.set_status_and_content(status_type::ok, "ok");
+      });
+
+  server.set_http_handler<GET>(
+      "/coro",
+      [](coro_http_request &req,
+         coro_http_response &resp) -> async_simple::coro::Lazy<void> {
+        resp.set_status_and_content(status_type::ok, "ok");
+        co_return;
+      });
+  server.aync_start(); // aync_start() don't block, sync_start() will block.
+  std::this_thread::sleep_for(300ms);  // wait for server start
+
+  coro_http_client client{};
+  auto result = co_await client.async_get("http://127.0.0.1:9001/get");
+  assert(result.status == 200);
+  assert(result.resp_body == "ok");
+  for (auto [key, val] : result.resp_headers) {
+    std::cout << key << ": " << val << "\n";
+  }
+}
 
 async_simple::coro::Lazy<void> get_post(coro_http_client &client) {
   std::string uri = "http://www.example.com";

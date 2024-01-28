@@ -92,8 +92,8 @@ assert(person2.value()==person1);
 ```cpp
 // deserialize to an existing object
 person person2;
-std::errc ec = deserialize_to(person2, buffer);
-assert(ec==std::errc{}); // person2.has_value() == true
+auto ec = deserialize_to(person2, buffer);
+assert(!ec); // no error
 assert(person2==person1);
 ```
 
@@ -327,11 +327,11 @@ void sp_serialize_to(Writer& writer, const array2D& ar) {
 }
 // 3. sp_deserialize_to: deserilize object from reader
 template </*struct_pack::reader_t*/ typename Reader>
-struct_pack::errc sp_deserialize_to(Reader& reader, array2D& ar) {
-  if (auto ec = struct_pack::read(reader, ar.x); ec != struct_pack::errc{}) {
+struct_pack::err_code sp_deserialize_to(Reader& reader, array2D& ar) {
+  if (auto ec = struct_pack::read(reader, ar.x); ec) {
     return ec;
   }
-  if (auto ec = struct_pack::read(reader, ar.y); ec != struct_pack::errc{}) {
+  if (auto ec = struct_pack::read(reader, ar.y); ec) {
     return ec;
   }
   auto length = 1ull * ar.x * ar.y * sizeof(float);
@@ -343,7 +343,7 @@ struct_pack::errc sp_deserialize_to(Reader& reader, array2D& ar) {
   }
   ar.p = (float*)malloc(length);
   auto ec = struct_pack::read(reader, ar.p, 1ull * ar.x * ar.y);
-  if (ec != struct_pack::errc{}) {
+  if (ec) {
     free(ar.p);
   }
   return ec;
@@ -357,7 +357,7 @@ struct_pack::errc sp_deserialize_to(Reader& reader, array2D& ar) {
 // need also define this function to skip deserialization of your type:
 
 // template <typename Reader>
-// struct_pack::errc sp_deserialize_to_with_skip(Reader& reader, array2D& ar);
+// struct_pack::err_code sp_deserialize_to_with_skip(Reader& reader, array2D& ar);
 
 }
 
@@ -507,7 +507,7 @@ user can also serialize type `base` then deserialize it to the `std::unique<base
 ```cpp
   auto ret = struct_pack::serialize(obj3{});
   auto result =
-      struct_pack::deserialize_derived_class<base, obj1, obj2, obj3>(buffer);
+      struct_pack::deserialize_derived_class<base, obj1, obj2, obj3>(ret);
   assert(result.has_value());   // check deserialize ok
   std::unique_ptr<base> ptr = std::move(result.value());
   assert(ptr != nullptr);
