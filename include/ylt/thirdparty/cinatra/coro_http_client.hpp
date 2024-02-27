@@ -246,7 +246,7 @@ class coro_http_client : public std::enable_shared_from_this<coro_http_client> {
     return true;
   }
 
-  [[nodiscard]] bool init_ssl(int verify_mode = asio::ssl::verify_peer,
+  [[nodiscard]] bool init_ssl(int verify_mode = asio::ssl::verify_none,
                               std::string full_path = "",
                               const std::string &sni_hostname = "") {
     std::string base_path;
@@ -811,6 +811,11 @@ class coro_http_client : public std::enable_shared_from_this<coro_http_client> {
     req_str_.clear();
     total_len_ = 0;
 #endif
+
+    // clear
+    head_buf_.consume(head_buf_.size());
+    chunked_buf_.consume(chunked_buf_.size());
+    resp_chunk_str_.clear();
   }
 
   async_simple::coro::Lazy<resp_data> reconnect(std::string uri) {
@@ -1040,7 +1045,7 @@ class coro_http_client : public std::enable_shared_from_this<coro_http_client> {
             else {
               host = std::string{u.host};
             }
-            bool r = init_ssl(asio::ssl::verify_peer, "", host);
+            bool r = init_ssl(asio::ssl::verify_none, "", host);
             if (!r) {
               data.net_err = std::make_error_code(std::errc::invalid_argument);
               co_return data;
@@ -1097,21 +1102,23 @@ class coro_http_client : public std::enable_shared_from_this<coro_http_client> {
 
   async_simple::coro::Lazy<std::error_code> handle_shake() {
 #ifdef CINATRA_ENABLE_SSL
-    if (has_init_ssl_) {
-      if (socket_->ssl_stream_ == nullptr) {
-        co_return std::make_error_code(std::errc::not_a_stream);
+    if (!has_init_ssl_) {
+      bool r = init_ssl(asio::ssl::verify_none, "", host_);
+      if (!r) {
+        co_return std::make_error_code(std::errc::invalid_argument);
       }
+    }
 
-      auto ec = co_await coro_io::async_handshake(
-          socket_->ssl_stream_, asio::ssl::stream_base::client);
-      if (ec) {
-        CINATRA_LOG_ERROR << "handle failed " << ec.message();
-      }
-      co_return ec;
+    if (socket_->ssl_stream_ == nullptr) {
+      co_return std::make_error_code(std::errc::not_a_stream);
     }
-    else {
-      co_return std::error_code{};
+
+    auto ec = co_await coro_io::async_handshake(socket_->ssl_stream_,
+                                                asio::ssl::stream_base::client);
+    if (ec) {
+      CINATRA_LOG_ERROR << "handle failed " << ec.message();
     }
+    co_return ec;
 #else
     // please open CINATRA_ENABLE_SSL before request https!
     co_return std::make_error_code(std::errc::protocol_error);
@@ -1774,8 +1781,8 @@ class coro_http_client : public std::enable_shared_from_this<coro_http_client> {
     head_buf_.consume(head_buf_.size());
     size_t header_size = 2;
     std::shared_ptr sock = socket_;
-    auto on_ws_msg = std::move(on_ws_msg_);
-    auto on_ws_close = std::move(on_ws_close_);
+    auto on_ws_msg = on_ws_msg_;
+    auto on_ws_close = on_ws_close_;
     asio::streambuf &read_buf = sock->head_buf_;
     bool has_init_ssl = false;
 #ifdef CINATRA_ENABLE_SSL
