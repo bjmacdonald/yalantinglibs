@@ -16,6 +16,7 @@
 #pragma once
 
 #include <async_simple/Executor.h>
+#include <async_simple/coro/Collect.h>
 #include <async_simple/coro/Lazy.h>
 #include <async_simple/coro/Sleep.h>
 #include <async_simple/coro/SyncAwait.h>
@@ -26,6 +27,7 @@
 
 #include <asio/connect.hpp>
 #include <asio/dispatch.hpp>
+#include <asio/experimental/channel.hpp>
 #include <asio/ip/tcp.hpp>
 #include <asio/read.hpp>
 #include <asio/read_at.hpp>
@@ -36,6 +38,7 @@
 #include <deque>
 
 #include "io_context_pool.hpp"
+#include "ylt/util/type_traits.h"
 
 namespace coro_io {
 
@@ -272,13 +275,11 @@ inline async_simple::coro::Lazy<std::error_code> async_handshake(
 #endif
 class period_timer : public asio::steady_timer {
  public:
+  using asio::steady_timer::steady_timer;
   template <typename T>
   period_timer(coro_io::ExecutorWrapper<T> *executor)
       : asio::steady_timer(executor->get_asio_executor()) {}
-  template <typename executor_t, typename Rep, typename Period>
-  period_timer(const executor_t &executor,
-               const std::chrono::duration<Rep, Period> &timeout_duration)
-      : asio::steady_timer(executor, timeout_duration) {}
+
   async_simple::coro::Lazy<bool> async_await() noexcept {
     callback_awaitor<bool> awaitor;
 
@@ -309,10 +310,10 @@ inline async_simple::coro::Lazy<void> sleep_for(Duration d) {
   }
 }
 
-template <typename R, typename Func>
+template <typename R, typename Func, typename Executor>
 struct post_helper {
   void operator()(auto handler) const {
-    asio::dispatch(e->get_asio_executor(), [this, handler]() {
+    asio::dispatch(e, [this, handler]() {
       try {
         if constexpr (std::is_same_v<R, async_simple::Try<void>>) {
           func();
@@ -329,22 +330,74 @@ struct post_helper {
       }
     });
   }
-  coro_io::ExecutorWrapper<> *e;
+  Executor e;
   Func func;
 };
+
+template <typename Func, typename Executor>
+inline async_simple::coro::Lazy<
+    async_simple::Try<typename util::function_traits<Func>::return_type>>
+post(Func func, Executor executor) {
+  using R =
+      async_simple::Try<typename util::function_traits<Func>::return_type>;
+
+  callback_awaitor<R> awaitor;
+  post_helper<R, Func, Executor> helper{executor, std::move(func)};
+  co_return co_await awaitor.await_resume(helper);
+}
 
 template <typename Func>
 inline async_simple::coro::Lazy<
     async_simple::Try<typename util::function_traits<Func>::return_type>>
 post(Func func,
      coro_io::ExecutorWrapper<> *e = coro_io::get_global_block_executor()) {
-  using R =
-      async_simple::Try<typename util::function_traits<Func>::return_type>;
+  co_return co_await post(std::move(func), e->get_asio_executor());
+}
 
-  callback_awaitor<R> awaitor;
+template <typename R>
+struct coro_channel
+    : public asio::experimental::channel<void(std::error_code, R)> {
+  using return_type = R;
+  using ValueType = std::pair<std::error_code, R>;
+  using asio::experimental::channel<void(std::error_code, R)>::channel;
+};
 
-  post_helper<R, Func> helper{e, std::move(func)};
-  co_return co_await awaitor.await_resume(helper);
+template <typename R>
+inline coro_channel<R> create_channel(
+    size_t capacity,
+    asio::io_context::executor_type executor =
+        coro_io::get_global_block_executor()->get_asio_executor()) {
+  return coro_channel<R>(executor, capacity);
+}
+
+template <typename T>
+inline async_simple::coro::Lazy<std::error_code> async_send(
+    asio::experimental::channel<void(std::error_code, T)> &channel, T val) {
+  callback_awaitor<std::error_code> awaitor;
+  co_return co_await awaitor.await_resume(
+      [&, val = std::move(val)](auto handler) {
+        channel.async_send({}, std::move(val), [handler](const auto &ec) {
+          handler.set_value_then_resume(ec);
+        });
+      });
+}
+
+template <typename Channel>
+async_simple::coro::Lazy<std::pair<
+    std::error_code,
+    typename Channel::return_type>> inline async_receive(Channel &channel) {
+  callback_awaitor<std::pair<std::error_code, typename Channel::return_type>>
+      awaitor;
+  co_return co_await awaitor.await_resume([&](auto handler) {
+    channel.async_receive([handler](auto ec, auto val) {
+      handler.set_value_then_resume(std::make_pair(ec, std::move(val)));
+    });
+  });
+}
+
+template <typename... T>
+auto select(T &&...args) {
+  return async_simple::coro::collectAny(std::forward<T>(args)...);
 }
 
 template <typename Socket, typename AsioBuffer>

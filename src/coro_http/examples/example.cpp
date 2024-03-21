@@ -543,6 +543,26 @@ void http_proxy() {
   assert(!resp_random.resp_body.empty());
 }
 
+void coro_channel() {
+  auto ch = coro_io::create_channel<int>(10000);
+  auto ec = async_simple::coro::syncAwait(coro_io::async_send(ch, 41));
+  assert(!ec);
+  ec = async_simple::coro::syncAwait(coro_io::async_send(ch, 42));
+  assert(!ec);
+
+  std::error_code err;
+  int val;
+  std::tie(err, val) =
+      async_simple::coro::syncAwait(coro_io::async_receive(ch));
+  assert(!err);
+  assert(val == 41);
+
+  std::tie(err, val) =
+      async_simple::coro::syncAwait(coro_io::async_receive(ch));
+  assert(!err);
+  assert(val == 42);
+}
+
 int main() {
   async_simple::coro::syncAwait(basic_usage());
   async_simple::coro::syncAwait(use_aspects());
@@ -554,5 +574,6 @@ int main() {
   test_gzip();
 #endif
   http_proxy();
+  coro_channel();
   return 0;
 }

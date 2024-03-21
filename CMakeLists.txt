@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.15)
 project(yaLanTingLibs
-        VERSION 0.2.9
+        VERSION 0.3.1
         DESCRIPTION "yaLanTingLibs"
         HOMEPAGE_URL "https://github.com/alibaba/yalantinglibs"
         LANGUAGES CXX
@@ -19,6 +19,7 @@ if(CMAKE_PROJECT_NAME STREQUAL "yaLanTingLibs") # if ylt is top-level project
         # add include path
         include_directories(include)
         include_directories(include/ylt/thirdparty)
+        include_directories(include/ylt/standalone)
         include_directories(src/include)
 
         include(cmake/utils.cmake)
