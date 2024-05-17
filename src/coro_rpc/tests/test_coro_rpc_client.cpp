@@ -56,6 +56,8 @@ Lazy<std::shared_ptr<coro_rpc_client>> create_client(
   co_return client;
 }
 
+void show(auto& s) { return; }
+
 TEST_CASE("testing client") {
   {
     coro_rpc::coro_rpc_client client;
@@ -72,9 +74,9 @@ TEST_CASE("testing client") {
   std::string port = std::to_string(coro_rpc_server_port);
   asio::io_context io_context;
   std::promise<void> promise;
+  auto worker = std::make_unique<asio::io_context::work>(io_context);
   auto future = promise.get_future();
   std::thread thd([&io_context, &promise] {
-    asio::io_context::work work(io_context);
     promise.set_value();
     io_context.run();
   });
@@ -116,7 +118,7 @@ TEST_CASE("testing client") {
     g_action = {};
     auto f = [&io_context, &port]() -> Lazy<void> {
       auto client = co_await create_client(io_context, port);
-      auto ret = co_await client->template call_for<hello_timeout>(20ms);
+      auto ret = co_await client->template call_for<hello_timeout>(10ms);
       CHECK_MESSAGE(ret.error().code == coro_rpc::errc::timed_out,
                     ret.error().msg);
       co_return;
@@ -146,6 +148,7 @@ TEST_CASE("testing client") {
       std::string arg;
       arg.resize(2048);
       auto ret = co_await client->template call<large_arg_fun>(arg);
+      show(ret);
       CHECK(ret.value() == arg);
       co_return;
     };
@@ -154,7 +157,7 @@ TEST_CASE("testing client") {
   }
 
   server.stop();
-  io_context.stop();
+  worker = nullptr;
   thd.join();
 }
 
@@ -163,8 +166,8 @@ TEST_CASE("testing client with inject server") {
   std::string port = std::to_string(coro_rpc_server_port);
   ELOGV(INFO, "inject server port: %d", port.data());
   asio::io_context io_context;
+  auto worker = std::make_unique<asio::io_context::work>(io_context);
   std::thread thd([&io_context] {
-    asio::io_context::work work(io_context);
     io_context.run();
   });
   coro_rpc_server server(2, coro_rpc_server_port);
@@ -205,6 +208,7 @@ TEST_CASE("testing client with inject server") {
       auto client = co_await create_client(io_context, port);
       g_action = inject_action::close_socket_after_send_length;
       auto ret = co_await client->template call<hello>();
+      show(ret);
       REQUIRE_MESSAGE(ret.error().code == coro_rpc::errc::io_error,
                       ret.error().msg);
     };
@@ -212,7 +216,7 @@ TEST_CASE("testing client with inject server") {
   }
 
   server.stop();
-  io_context.stop();
+  worker = nullptr;
   thd.join();
   g_action = inject_action::nothing;
 }
@@ -245,15 +249,15 @@ class SSLClientTester {
 
     std::promise<void> promise;
     auto future = promise.get_future();
+    worker = std::make_unique<asio::io_context::work>(io_context);
     thd = std::thread([this, &promise] {
-      asio::io_context::work work(io_context);
       promise.set_value();
       io_context.run();
     });
     future.wait();
   }
   ~SSLClientTester() {
-    io_context.stop();
+    worker = nullptr;
     thd.join();
   }
   void inject(std::string msg, std::string& path, ssl_type type) {
@@ -342,6 +346,7 @@ class SSLClientTester {
   ssl_type dh;
   asio::io_context io_context;
   std::thread thd;
+  std::unique_ptr<asio::io_context::work> worker;
 };
 
 TEST_CASE("testing client with ssl server") {
@@ -420,7 +425,7 @@ TEST_CASE("testing client with context response user-defined error") {
   server.register_handler<error_with_context, hello>();
   auto ret = client.sync_call<error_with_context>();
   REQUIRE(!ret.has_value());
-  CHECK(ret.error().code == coro_rpc::errc{104});
+  CHECK(ret.error().code == coro_rpc::errc{1004});
   CHECK(ret.error().msg == "My Error.");
   CHECK(client.has_closed() == false);
   auto ret2 = client.sync_call<hello>();

@@ -127,6 +127,8 @@ class coro_http_request {
 
   const auto &get_queries() const { return parser_.queries(); }
 
+  std::string_view full_url() { return parser_.full_url(); }
+
   void set_body(std::string &body) {
     body_ = body;
     auto type = get_content_type();
@@ -204,6 +206,14 @@ class coro_http_request {
 
     is_websocket_ = true;
     return true;
+  }
+
+  bool is_support_compressed() {
+    auto extension_str = get_header_value("Sec-WebSocket-Extensions");
+    if (extension_str.find("permessage-deflate") != std::string::npos) {
+      return true;
+    }
+    return false;
   }
 
   void set_aspect_data(std::string data) {

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023, Alibaba Group Holding Limited;
+ * Copyright (c) 2024, Alibaba Group Holding Limited;
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,4 +14,10 @@
  * limitations under the License.
  */
 #pragma once
-#include "impl/protocol/coro_rpc_protocol.hpp"
+
+// Note: Update the version when release a new version.
+
+// YLT_VERSION % 100 is the sub-minor version
+// YLT_VERSION / 100 % 1000 is the minor version
+// YLT_VERSION / 100000 is the major version
+#define YLT_VERSION 302  // 0.3.2

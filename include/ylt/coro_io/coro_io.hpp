@@ -42,13 +42,17 @@
 
 namespace coro_io {
 
+template <typename T>
+constexpr inline bool is_lazy_v =
+    util::is_specialization_v<std::remove_cvref_t<T>, async_simple::coro::Lazy>;
+
 template <typename Arg, typename Derived>
 class callback_awaitor_base {
  private:
   template <typename Op>
   class callback_awaitor_impl {
    public:
-    callback_awaitor_impl(Derived &awaitor, const Op &op) noexcept
+    callback_awaitor_impl(Derived &awaitor, Op &op) noexcept
         : awaitor(awaitor), op(op) {}
     constexpr bool await_ready() const noexcept { return false; }
     void await_suspend(std::coroutine_handle<> handle) noexcept {
@@ -69,7 +73,7 @@ class callback_awaitor_base {
 
    private:
     Derived &awaitor;
-    const Op &op;
+    Op &op;
   };
 
  public:
@@ -97,7 +101,7 @@ class callback_awaitor_base {
     Derived *obj;
   };
   template <typename Op>
-  callback_awaitor_impl<Op> await_resume(const Op &op) noexcept {
+  callback_awaitor_impl<Op> await_resume(Op &&op) noexcept {
     return callback_awaitor_impl<Op>{static_cast<Derived &>(*this), op};
   }
 
@@ -312,8 +316,8 @@ inline async_simple::coro::Lazy<void> sleep_for(Duration d) {
 
 template <typename R, typename Func, typename Executor>
 struct post_helper {
-  void operator()(auto handler) const {
-    asio::dispatch(e, [this, handler]() {
+  void operator()(auto handler) {
+    asio::post(e, [this, handler]() {
       try {
         if constexpr (std::is_same_v<R, async_simple::Try<void>>) {
           func();
@@ -395,9 +399,64 @@ async_simple::coro::Lazy<std::pair<
   });
 }
 
+template <typename T>
+inline decltype(auto) select_impl(T &pair) {
+  using Func = std::tuple_element_t<1, std::remove_cvref_t<T>>;
+  using ValueType =
+      typename std::tuple_element_t<0, std::remove_cvref_t<T>>::ValueType;
+  using return_type = std::invoke_result_t<Func, async_simple::Try<ValueType>>;
+
+  auto &callback = std::get<1>(pair);
+  if constexpr (coro_io::is_lazy_v<return_type>) {
+    auto executor = std::get<0>(pair).getExecutor();
+    return std::make_pair(
+        std::move(std::get<0>(pair)),
+        [executor, callback = std::move(callback)](auto &&val) {
+          if (executor) {
+            callback(std::move(val)).via(executor).start([](auto &&) {
+            });
+          }
+          else {
+            callback(std::move(val)).start([](auto &&) {
+            });
+          }
+        });
+  }
+  else {
+    return pair;
+  }
+}
+
 template <typename... T>
-auto select(T &&...args) {
-  return async_simple::coro::collectAny(std::forward<T>(args)...);
+inline auto select(T &&...args) {
+  return async_simple::coro::collectAny(select_impl(args)...);
+}
+
+template <typename T, typename Callback>
+inline auto select(std::vector<T> vec, Callback callback) {
+  if constexpr (coro_io::is_lazy_v<Callback>) {
+    std::vector<async_simple::Executor *> executors;
+    for (auto &lazy : vec) {
+      executors.push_back(lazy.getExecutor());
+    }
+
+    return async_simple::coro::collectAny(
+        std::move(vec),
+        [executors, callback = std::move(callback)](size_t index, auto &&val) {
+          auto executor = executors[index];
+          if (executor) {
+            callback(index, std::move(val)).via(executor).start([](auto &&) {
+            });
+          }
+          else {
+            callback(index, std::move(val)).start([](auto &&) {
+            });
+          }
+        });
+  }
+  else {
+    return async_simple::coro::collectAny(std::move(vec), std::move(callback));
+  }
 }
 
 template <typename Socket, typename AsioBuffer>
