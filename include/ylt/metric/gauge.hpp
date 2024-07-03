@@ -24,9 +24,9 @@ class gauge_t : public counter_t {
 
   void dec(double value = 1) {
 #ifdef __APPLE__
-    mac_os_atomic_fetch_sub(&default_lable_value_, value);
+    mac_os_atomic_fetch_sub(&default_label_value_, value);
 #else
-    default_lable_value_ -= value;
+    default_label_value_ -= value;
 #endif
   }
 
@@ -45,6 +45,7 @@ class gauge_t : public counter_t {
     }
     else {
       std::lock_guard lock(mtx_);
+      stat_metric(labels_value);
       set_value<false>(value_map_[labels_value], value, op_type_t::DEC);
     }
   }

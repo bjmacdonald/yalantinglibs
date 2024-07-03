@@ -9,11 +9,17 @@
 #include <regex>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "async_simple/coro/Lazy.h"
 #include "async_simple/coro/SyncAwait.h"
 #include "cinatra/cinatra_log_wrapper.hpp"
+#if __has_include("ylt/coro_io/coro_io.hpp")
+#include "ylt/coro_io/coro_io.hpp"
+#else
+#include "cinatra/ylt/coro_io/coro_io.hpp"
+#endif
 
 #ifdef CINATRA_ENABLE_METRIC_JSON
 namespace iguana {
@@ -42,11 +48,33 @@ struct metric_filter_options {
   bool is_white = true;
 };
 
+struct vector_hash {
+  size_t operator()(const std::vector<std::string>& vec) const {
+    unsigned int seed = 131;
+    unsigned int hash = 0;
+
+    for (const auto& str : vec) {
+      for (auto ch : str) {
+        hash = hash * seed + ch;
+      }
+    }
+
+    return (hash & 0x7FFFFFFF);
+  }
+};
+
+template <typename T>
+using metric_hash_map =
+    std::unordered_map<std::vector<std::string>, T, vector_hash>;
+
 class metric_t {
  public:
   metric_t() = default;
   metric_t(MetricType type, std::string name, std::string help)
-      : type_(type), name_(std::move(name)), help_(std::move(help)) {}
+      : type_(type),
+        name_(std::move(name)),
+        help_(std::move(help)),
+        metric_created_time_(std::chrono::system_clock::now()) {}
   metric_t(MetricType type, std::string name, std::string help,
            std::vector<std::string> labels_name)
       : metric_t(type, std::move(name), std::move(help)) {
@@ -70,6 +98,8 @@ class metric_t {
 
   MetricType metric_type() { return type_; }
 
+  auto get_created_time() { return metric_created_time_; }
+
   std::string_view metric_name() {
     switch (type_) {
       case MetricType::Counter:
@@ -92,11 +122,7 @@ class metric_t {
     return static_labels_;
   }
 
-  virtual std::map<std::vector<std::string>, double,
-                   std::less<std::vector<std::string>>>
-  value_map() {
-    return {};
-  }
+  virtual metric_hash_map<double> value_map() { return {}; }
 
   virtual void serialize(std::string& str) {}
 
@@ -173,9 +199,29 @@ class metric_t {
   std::vector<std::string> labels_name_;   // read only
   std::vector<std::string> labels_value_;  // read only
   bool use_atomic_ = false;
+  std::chrono::system_clock::time_point metric_created_time_{};
 };
 
-template <size_t ID = 0>
+template <typename Tag>
+struct metric_manager_t;
+
+struct ylt_system_tag_t {};
+using system_metric_manager = metric_manager_t<ylt_system_tag_t>;
+
+class counter_t;
+inline auto g_user_metric_labels =
+    std::make_shared<counter_t>("ylt_user_metric_labels", "");
+inline auto g_summary_failed_count =
+    std::make_shared<counter_t>("ylt_summary_failed_count", "");
+inline std::atomic<int64_t> g_user_metric_count = 0;
+
+inline std::atomic<int64_t> ylt_metric_capacity = 10000000;
+
+inline void set_metric_capacity(int64_t max_count) {
+  ylt_metric_capacity = max_count;
+}
+
+template <typename Tag>
 struct metric_manager_t {
   struct null_mutex_t {
     void lock() {}
@@ -223,10 +269,56 @@ struct metric_manager_t {
     return remove_metric_impl<true>(name);
   }
 
+  static bool remove_metric_dynamic(std::shared_ptr<metric_t> metric) {
+    return remove_metric_impl<true>(std::string(metric->name()));
+  }
+
+  static void remove_metric_dynamic(const std::vector<std::string>& names) {
+    if (names.empty()) {
+      return;
+    }
+    auto lock = get_lock<true>();
+    for (auto& name : names) {
+      metric_map_.erase(name);
+    }
+  }
+
+  static void remove_metric_dynamic(
+      std::vector<std::shared_ptr<metric_t>> metrics) {
+    if (metrics.empty()) {
+      return;
+    }
+    auto lock = get_lock<true>();
+    for (auto& metric : metrics) {
+      metric_map_.erase(std::string(metric->name()));
+    }
+  }
+
   template <typename... Metrics>
   static bool register_metric_dynamic(Metrics... metrics) {
     bool r = true;
     ((void)(r && (r = register_metric_impl<true>(metrics), true)), ...);
+    return r;
+  }
+
+  static bool register_metric_dynamic(
+      std::vector<std::shared_ptr<metric_t>> metrics) {
+    bool r = true;
+    std::vector<std::shared_ptr<metric_t>> vec;
+    for (auto& metric : metrics) {
+      r = register_metric_impl<true>(metric);
+      if (!r) {
+        r = false;
+        break;
+      }
+
+      vec.push_back(metric);
+    }
+
+    if (!r) {
+      remove_metric_dynamic(vec);
+    }
+
     return r;
   }
 
@@ -235,6 +327,15 @@ struct metric_manager_t {
     bool r = true;
     ((void)(r && (r = register_metric_impl<false>(metrics), true)), ...);
     return r;
+  }
+
+  static auto get_metrics() {
+    if (need_lock_) {
+      return collect<true>();
+    }
+    else {
+      return collect<false>();
+    }
   }
 
   static auto metric_map_static() { return metric_map_impl<false>(); }
@@ -426,6 +527,11 @@ struct metric_manager_t {
 
     std::string name(metric->name());
     auto lock = get_lock<need_lock>();
+    if (g_user_metric_count > ylt_metric_capacity) {
+      CINATRA_LOG_ERROR << "metric count at capacity size: "
+                        << g_user_metric_count;
+      return false;
+    }
     bool r = metric_map_.emplace(name, std::move(metric)).second;
     if (!r) {
       CINATRA_LOG_ERROR << "duplicate registered metric name: " << name;
@@ -547,12 +653,42 @@ struct metric_manager_t {
   }
 
   static inline std::mutex mtx_;
-  static inline std::map<std::string, std::shared_ptr<metric_t>> metric_map_;
+  static inline std::unordered_map<std::string, std::shared_ptr<metric_t>>
+      metric_map_;
 
   static inline null_mutex_t null_mtx_;
   static inline std::atomic_bool need_lock_ = true;
   static inline std::once_flag flag_;
 };
 
-using default_metric_manager = metric_manager_t<0>;
+struct ylt_default_metric_tag_t {};
+using default_metric_manager = metric_manager_t<ylt_default_metric_tag_t>;
+
+template <typename... Args>
+struct metric_collector_t {
+  static std::string serialize() {
+    auto vec = get_all_metrics();
+    return default_metric_manager::serialize(vec);
+  }
+
+#ifdef CINATRA_ENABLE_METRIC_JSON
+  static std::string serialize_to_json() {
+    auto vec = get_all_metrics();
+    return default_metric_manager::serialize_to_json(vec);
+  }
+#endif
+
+  static std::vector<std::shared_ptr<metric_t>> get_all_metrics() {
+    std::vector<std::shared_ptr<metric_t>> vec;
+    (append_vector<Args>(vec), ...);
+    return vec;
+  }
+
+ private:
+  template <typename T>
+  static void append_vector(std::vector<std::shared_ptr<metric_t>>& vec) {
+    auto v = T::get_metrics();
+    vec.insert(vec.end(), v.begin(), v.end());
+  }
+};
 }  // namespace ylt::metric
