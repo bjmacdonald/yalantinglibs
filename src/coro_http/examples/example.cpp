@@ -17,6 +17,7 @@
 
 #include "ylt/coro_http/coro_http_client.hpp"
 #include "ylt/coro_http/coro_http_server.hpp"
+#include "ylt/coro_io/coro_io.hpp"
 
 using namespace std::chrono_literals;
 using namespace coro_http;
@@ -76,7 +77,7 @@ async_simple::coro::Lazy<resp_data> chunked_upload1(coro_http_client &client) {
   create_file(filename, 1010);
 
   coro_io::coro_file file{};
-  co_await file.async_open(filename, coro_io::flags::read_only);
+  file.open(filename, std::ios::in);
 
   std::string buf;
   detail::resize(buf, 100);
@@ -628,8 +629,8 @@ void http_proxy() {
   assert(!resp_random.resp_body.empty());
 }
 
-void coro_channel() {
-  auto ch = coro_io::create_channel<int>(10000);
+void coro_load_blancer() {
+  auto ch = coro_io::create_load_blancer<int>(10000);
   auto ec = async_simple::coro::syncAwait(coro_io::async_send(ch, 41));
   assert(!ec);
   ec = async_simple::coro::syncAwait(coro_io::async_send(ch, 42));
@@ -660,6 +661,6 @@ int main() {
   test_gzip();
 #endif
   http_proxy();
-  coro_channel();
+  coro_load_blancer();
   return 0;
 }

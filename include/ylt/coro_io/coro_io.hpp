@@ -26,7 +26,6 @@
 #endif
 
 #include <asio/connect.hpp>
-#include <asio/dispatch.hpp>
 #include <asio/experimental/channel.hpp>
 #include <asio/ip/tcp.hpp>
 #include <asio/read.hpp>
@@ -38,13 +37,16 @@
 #include <deque>
 
 #include "io_context_pool.hpp"
+#if __has_include("ylt/util/type_traits.h")
 #include "ylt/util/type_traits.h"
+#else
+#include "../util/type_traits.h"
+#endif
 #ifdef __linux__
 #include <sys/sendfile.h>
 #endif
 
 namespace coro_io {
-
 template <typename T>
 constexpr inline bool is_lazy_v =
     util::is_specialization_v<std::remove_cvref_t<T>, async_simple::coro::Lazy>;
@@ -362,24 +364,41 @@ post(Func func,
 }
 
 template <typename R>
-struct coro_channel
-    : public asio::experimental::channel<void(std::error_code, R)> {
+struct channel : public asio::experimental::channel<void(std::error_code, R)> {
   using return_type = R;
   using ValueType = std::pair<std::error_code, R>;
   using asio::experimental::channel<void(std::error_code, R)>::channel;
+  channel(coro_io::ExecutorWrapper<> *executor, size_t capacity)
+      : executor_(executor),
+        asio::experimental::channel<void(std::error_code, R)>(
+            executor->get_asio_executor(), capacity) {}
+  auto get_executor() { return executor_; }
+
+ private:
+  coro_io::ExecutorWrapper<> *executor_;
 };
 
 template <typename R>
-inline coro_channel<R> create_channel(
+inline channel<R> create_load_blancer(
     size_t capacity,
-    asio::io_context::executor_type executor =
-        coro_io::get_global_block_executor()->get_asio_executor()) {
-  return coro_channel<R>(executor, capacity);
+    coro_io::ExecutorWrapper<> *executor = coro_io::get_global_executor()) {
+  return channel<R>(executor, capacity);
+}
+
+template <typename R>
+inline auto create_shared_channel(
+    size_t capacity,
+    coro_io::ExecutorWrapper<> *executor = coro_io::get_global_executor()) {
+  return std::make_shared<channel<R>>(executor, capacity);
 }
 
 template <typename T>
 inline async_simple::coro::Lazy<std::error_code> async_send(
     asio::experimental::channel<void(std::error_code, T)> &channel, T val) {
+  bool r = channel.try_send(std::error_code{}, val);
+  if (r) {
+    co_return std::error_code{};
+  }
   callback_awaitor<std::error_code> awaitor;
   co_return co_await awaitor.await_resume(
       [&, val = std::move(val)](auto handler) {
@@ -393,6 +412,14 @@ template <typename Channel>
 async_simple::coro::Lazy<std::pair<
     std::error_code,
     typename Channel::return_type>> inline async_receive(Channel &channel) {
+  using value_type = typename Channel::return_type;
+  value_type val;
+  bool r = channel.try_receive([&val](std::error_code, value_type result) {
+    val = result;
+  });
+  if (r) {
+    co_return std::make_pair(std::error_code{}, val);
+  }
   callback_awaitor<std::pair<std::error_code, typename Channel::return_type>>
       awaitor;
   co_return co_await awaitor.await_resume([&](auto handler) {
@@ -507,7 +534,14 @@ inline std::error_code connect(executor_t &executor,
 }
 
 #ifdef __linux__
+// this help us ignore SIGPIPE when send data to a unexpected closed socket.
+inline auto pipe_signal_handler = [] {
+  std::signal(SIGPIPE, SIG_IGN);
+  return 0;
+}();
 
+// FIXME: this function may not thread-safe if it not running in socket's
+// executor
 inline async_simple::coro::Lazy<std::pair<std::error_code, std::size_t>>
 async_sendfile(asio::ip::tcp::socket &socket, int fd, off_t offset,
                size_t size) noexcept {
@@ -523,8 +557,8 @@ async_sendfile(asio::ip::tcp::socket &socket, int fd, off_t offset,
     while (true) {
       // Try the system call.
       errno = 0;
-      int n = ::sendfile(socket.native_handle(), fd, &offset,
-                         std::min(std::size_t{65536}, least_bytes));
+      ssize_t n = ::sendfile(socket.native_handle(), fd, &offset,
+                             std::min(std::size_t{65536}, least_bytes));
       ec = asio::error_code(n < 0 ? errno : 0,
                             asio::error::get_system_category());
       least_bytes -= ec ? 0 : n;
@@ -543,7 +577,6 @@ async_sendfile(asio::ip::tcp::socket &socket, int fd, off_t offset,
                               handler.set_value_then_resume(ec);
                             });
         });
-        continue;
       }
       if (ec || n == 0 || least_bytes == 0) [[unlikely]] {  // End of File
         break;

@@ -4,50 +4,93 @@
 #include "counter.hpp"
 
 namespace ylt::metric {
-class gauge_t : public counter_t {
+
+template <typename value_type>
+class basic_static_gauge : public basic_static_counter<value_type> {
+  using metric_t::set_metric_type;
+  using basic_static_counter<value_type>::default_label_value_;
+  using metric_t::labels_value_;
+  using basic_static_counter<value_type>::dupli_count_;
+
  public:
-  gauge_t(std::string name, std::string help)
-      : counter_t(std::move(name), std::move(help)) {
-    set_metric_type(MetricType::Gauge);
-  }
-  gauge_t(std::string name, std::string help,
-          std::vector<std::string> labels_name)
-      : counter_t(std::move(name), std::move(help), std::move(labels_name)) {
+  basic_static_gauge(std::string name, std::string help, size_t dupli_count = 2)
+      : basic_static_counter<value_type>(std::move(name), std::move(help),
+                                         dupli_count) {
     set_metric_type(MetricType::Gauge);
   }
 
-  gauge_t(std::string name, std::string help,
-          std::map<std::string, std::string> labels)
-      : counter_t(std::move(name), std::move(help), std::move(labels)) {
+  basic_static_gauge(std::string name, std::string help,
+                     std::map<std::string, std::string> labels,
+                     size_t dupli_count = 2)
+      : basic_static_counter<value_type>(std::move(name), std::move(help),
+                                         std::move(labels), dupli_count) {
     set_metric_type(MetricType::Gauge);
   }
 
-  void dec(double value = 1) {
+  void dec(value_type value = 1) {
 #ifdef __APPLE__
-    mac_os_atomic_fetch_sub(&default_label_value_, value);
+    if constexpr (std::is_floating_point_v<value_type>) {
+      mac_os_atomic_fetch_sub(&default_label_value_.local_value(), value);
+    }
+    else {
+      default_label_value_.dec(value);
+    }
 #else
-    default_label_value_ -= value;
+    default_label_value_.dec(value);
 #endif
   }
+};
+using gauge_t = basic_static_gauge<int64_t>;
+using gauge_d = basic_static_gauge<double>;
 
-  void dec(const std::vector<std::string>& labels_value, double value = 1) {
+template <typename value_type, size_t N>
+class basic_dynamic_gauge : public basic_dynamic_counter<value_type, N> {
+  using metric_t::set_metric_type;
+  using basic_dynamic_counter<value_type, N>::value_map_;
+  using basic_dynamic_counter<value_type, N>::mtx_;
+  using basic_dynamic_counter<value_type, N>::dupli_count_;
+
+ public:
+  basic_dynamic_gauge(std::string name, std::string help,
+                      std::array<std::string, N> labels_name,
+                      size_t dupli_count = 2)
+      : basic_dynamic_counter<value_type, N>(std::move(name), std::move(help),
+                                             std::move(labels_name),
+                                             dupli_count) {
+    set_metric_type(MetricType::Gauge);
+  }
+
+  void dec(const std::array<std::string, N>& labels_value,
+           value_type value = 1) {
     if (value == 0) {
       return;
     }
 
-    validate(labels_value, value);
-    if (use_atomic_) {
-      if (labels_value != labels_value_) {
-        throw std::invalid_argument(
-            "the given labels_value is not match with origin labels_value");
-      }
-      set_value<true>(atomic_value_map_[labels_value], value, op_type_t::DEC);
+    std::lock_guard lock(mtx_);
+    auto [it, r] = value_map_.try_emplace(
+        labels_value, thread_local_value<value_type>(dupli_count_));
+    if (r) {
+      g_user_metric_label_count++;  // TODO: use thread local
     }
-    else {
-      std::lock_guard lock(mtx_);
-      stat_metric(labels_value);
-      set_value<false>(value_map_[labels_value], value, op_type_t::DEC);
-    }
+
+    set_value(it->second.local_value(), value, op_type_t::DEC);
   }
 };
+
+using dynamic_gauge_1t = basic_dynamic_gauge<int64_t, 1>;
+using dynamic_gauge_1d = basic_dynamic_gauge<double, 1>;
+
+using dynamic_gauge_t = basic_dynamic_gauge<int64_t, 2>;
+using dynamic_gauge_d = basic_dynamic_gauge<double, 2>;
+using dynamic_gauge_2t = dynamic_gauge_t;
+using dynamic_gauge_2d = dynamic_gauge_d;
+
+using dynamic_gauge_3t = basic_dynamic_gauge<int64_t, 3>;
+using dynamic_gauge_3d = basic_dynamic_gauge<double, 3>;
+
+using dynamic_gauge_4t = basic_dynamic_gauge<int64_t, 4>;
+using dynamic_gauge_4d = basic_dynamic_gauge<double, 4>;
+
+using dynamic_gauge_5t = basic_dynamic_gauge<int64_t, 5>;
+using dynamic_gauge_5d = basic_dynamic_gauge<double, 5>;
 }  // namespace ylt::metric

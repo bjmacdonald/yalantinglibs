@@ -55,7 +55,7 @@ template <typename client_t, typename io_context_pool_t>
 class client_pools;
 
 template <typename, typename>
-class channel;
+class load_blancer;
 
 template <typename client_t,
           typename io_context_pool_t = coro_io::io_context_pool>
@@ -113,6 +113,21 @@ class client_pool : public std::enable_shared_from_this<
     return std::chrono::milliseconds{static_cast<long>(e(r) * ms.count())};
   }
 
+  static async_simple::coro::Lazy<std::pair<bool, std::chrono::milliseconds>>
+  reconnect_impl(std::unique_ptr<client_t>& client,
+                 std::shared_ptr<client_pool>& self) {
+    auto pre_time_point = std::chrono::steady_clock::now();
+    auto result = co_await client->connect(self->host_name_);
+    bool ok = client_t::is_ok(result);
+    auto post_time_point = std::chrono::steady_clock::now();
+    auto cost_time = std::chrono::duration_cast<std::chrono::milliseconds>(
+        post_time_point - pre_time_point);
+    ELOG_TRACE << "reconnect client{" << client.get()
+               << "} cost time: " << cost_time / std::chrono::milliseconds{1}
+               << "ms";
+    co_return std::pair{ok, cost_time};
+  }
+
   static async_simple::coro::Lazy<void> reconnect(
       std::unique_ptr<client_t>& client, std::weak_ptr<client_pool> watcher) {
     using namespace std::chrono_literals;
@@ -121,15 +136,9 @@ class client_pool : public std::enable_shared_from_this<
     do {
       ELOG_TRACE << "try to reconnect client{" << client.get() << "},host:{"
                  << client->get_host() << ":" << client->get_port()
-                 << "}, try count:" << i << "max retry limit:"
+                 << "}, try count:" << i + 1 << "max retry limit:"
                  << self->pool_config_.connect_retry_count;
-      auto pre_time_point = std::chrono::steady_clock::now();
-      bool ok = client_t::is_ok(co_await client->connect(self->host_name_));
-      auto post_time_point = std::chrono::steady_clock::now();
-      auto cost_time = post_time_point - pre_time_point;
-      ELOG_TRACE << "reconnect client{" << client.get()
-                 << "} cost time: " << cost_time / std::chrono::milliseconds{1}
-                 << "ms";
+      auto [ok, cost_time] = co_await reconnect_impl(client, self);
       if (ok) {
         ELOG_TRACE << "reconnect client{" << client.get() << "} success";
         co_return;
@@ -148,30 +157,64 @@ class client_pool : public std::enable_shared_from_this<
     ELOG_WARN << "reconnect client{" << client.get() << "},host:{"
               << client->get_host() << ":" << client->get_port()
               << "} out of max limit, stop retry. connect failed";
+    alive_detect(client->get_config(), std::move(self)).start([](auto&&) {
+    });
     client = nullptr;
   }
 
-  struct promise_handler {
-    std::atomic<bool> flag_ = false;
-    async_simple::Promise<std::unique_ptr<client_t>> promise_;
-  };
-
-  static async_simple::coro::Lazy<void> connect_client(
-      std::unique_ptr<client_t> client, std::weak_ptr<client_pool> watcher,
-      std::shared_ptr<promise_handler> handler) {
-    co_await reconnect(client, watcher);
-    auto has_get_connect = handler->flag_.exchange(true);
-    if (!has_get_connect) {
-      handler->promise_.setValue(std::move(client));
-    }
-    else {
-      if (client) {
-        auto self = watcher.lock();
-        auto conn_lim =
-            std::min<unsigned>(10u, self->pool_config_.max_connection);
-        if (self && self->free_clients_.size() < conn_lim) {
-          self->enqueue(self->free_clients_, std::move(client),
-                        self->pool_config_.idle_timeout);
+  static async_simple::coro::Lazy<void> alive_detect(
+      const typename client_t::config& client_config,
+      std::weak_ptr<client_pool> watcher) {
+    std::shared_ptr<client_pool> self = watcher.lock();
+    using namespace std::chrono_literals;
+    if (self && self->pool_config_.host_alive_detect_duration.count() != 0 &&
+        self->free_client_count() == 0) {
+      bool expected = true;
+      if (!self->is_alive_.compare_exchange_strong(
+              expected, false)) {  // other alive detect coroutine is running.
+        co_return;
+      }
+      if (self->free_client_count() > 0) {  // recheck for multi-thread
+        self->is_alive_ = true;
+        co_return;
+      }
+      auto executor = self->io_context_pool_.get_executor();
+      auto client = std::make_unique<client_t>(*executor);
+      if (!client->init_config(client_config))
+        AS_UNLIKELY {
+          ELOG_ERROR << "Init client config failed in host alive detect. That "
+                        "is not expected.";
+          co_return;
+        }
+      while (true) {
+        auto [ok, cost_time] = co_await reconnect_impl(client, self);
+        if (ok) {
+          ELOG_TRACE << "reconnect client{" << client.get()
+                     << "} success. stop alive detect.";
+          self->collect_free_client(std::move(client));
+          self->is_alive_ =
+              true; /*if client close(), we still mark it as alive*/
+          co_return;
+        }
+        if (self->is_alive_) {
+          ELOG_TRACE << "client pool is aliving, stop connect client {"
+                     << client.get() << "} for alive detect";
+          co_return;
+        }
+        ELOG_TRACE << "reconnect client{" << client.get()
+                   << "} failed. continue alive detect.";
+        auto wait_time = rand_time(
+            (self->pool_config_.host_alive_detect_duration - cost_time) / 1ms *
+            1ms);
+        self = nullptr;
+        if (wait_time.count() > 0) {
+          co_await coro_io::sleep_for(wait_time, &client->get_executor());
+        }
+        self = watcher.lock();
+        if (self->is_alive_) {
+          ELOG_TRACE << "client pool is aliving, stop connect client {"
+                     << client.get() << "} for alive detect";
+          co_return;
         }
       }
     }
@@ -193,46 +236,7 @@ class client_pool : public std::enable_shared_from_this<
           ELOG_ERROR << "init client config failed.";
           co_return nullptr;
         }
-      auto client_ptr = client.get();
-      auto handler = std::make_shared<promise_handler>();
-      connect_client(std::move(client), this->weak_from_this(), handler)
-          .start([](auto&&) {
-          });
-      auto timer = std::make_shared<coro_io::period_timer>(
-          executor->get_asio_executor());
-      timer->expires_after(std::chrono::milliseconds{20});
-      timer->async_await().start([watcher = this->weak_from_this(), handler,
-                                  client_ptr, timer](auto&& res) {
-        if (res.value() && !handler->flag_) {
-          if (auto self = watcher.lock(); self) {
-            ++self->promise_cnt_;
-            self->promise_queue_.enqueue(handler);
-            timer->expires_after(
-                (std::max)(std::chrono::milliseconds{0},
-                           self->pool_config_.max_connection_time -
-                               std::chrono::milliseconds{20}));
-            timer->async_await().start([handler = std::move(handler),
-                                        client_ptr = client_ptr](auto&& res) {
-              auto has_get_connect = handler->flag_.exchange(true);
-              if (!has_get_connect) {
-                ELOG_ERROR << "Out of max limitation of connect "
-                              "time, connect "
-                              "failed. skip wait client{"
-                           << client_ptr << "} connect. ";
-                handler->promise_.setValue(std::unique_ptr<client_t>{nullptr});
-              }
-            });
-          }
-        }
-      });
-      ELOG_TRACE << "wait client by promise {" << &handler->promise_ << "}";
-      client = co_await handler->promise_.getFuture();
-      if (client) {
-        executor->schedule([timer] {
-          std::error_code ignore_ec;
-          timer->cancel(ignore_ec);
-        });
-      }
+      co_await reconnect(client, this->weak_from_this());
     }
     else {
       ELOG_TRACE << "get free client{" << client.get() << "}. from queue";
@@ -262,28 +266,9 @@ class client_pool : public std::enable_shared_from_this<
 
   void collect_free_client(std::unique_ptr<client_t> client) {
     if (!client->has_closed()) {
-      std::shared_ptr<promise_handler> handler;
-      if (promise_cnt_) {
-        int cnt = 0;
-        while (promise_queue_.try_dequeue(handler)) {
-          ++cnt;
-          auto has_get_connect = handler->flag_.exchange(true);
-          if (!has_get_connect) {
-            handler->promise_.setValue(std::move(client));
-            promise_cnt_ -= cnt;
-            ELOG_TRACE << "collect free client{" << client.get()
-                       << "} and wake up promise{" << &handler->promise_ << "}";
-            return;
-          }
-        }
-        promise_cnt_ -= cnt;
-      }
-
       if (free_clients_.size() < pool_config_.max_connection) {
-        if (client) {
-          ELOG_TRACE << "collect free client{" << client.get() << "} enqueue";
-          enqueue(free_clients_, std::move(client), pool_config_.idle_timeout);
-        }
+        ELOG_TRACE << "collect free client{" << client.get() << "} enqueue";
+        enqueue(free_clients_, std::move(client), pool_config_.idle_timeout);
       }
       else {
         ELOG_TRACE << "out of max connection limit <<"
@@ -292,6 +277,7 @@ class client_pool : public std::enable_shared_from_this<
         enqueue(short_connect_clients_, std::move(client),
                 pool_config_.short_connect_idle_timeout);
       }
+      is_alive_ = true;
     }
     else {
       ELOG_TRACE << "client{" << client.get()
@@ -329,7 +315,8 @@ class client_pool : public std::enable_shared_from_this<
     std::chrono::milliseconds reconnect_wait_time{1000};
     std::chrono::milliseconds idle_timeout{30000};
     std::chrono::milliseconds short_connect_idle_timeout{1000};
-    std::chrono::milliseconds max_connection_time{60000};
+    std::chrono::milliseconds host_alive_detect_duration{
+        30000}; /* zero means wont detect */
     typename client_t::config client_config;
   };
 
@@ -397,6 +384,12 @@ class client_pool : public std::enable_shared_from_this<
   std::size_t free_client_count() const noexcept {
     return free_clients_.size() + short_connect_clients_.size();
   }
+  /**
+   * @brief if host may not useable now.
+   *
+   * @return bool
+   */
+  bool is_alive() const noexcept { return is_alive_; }
 
   /**
    * @brief approx connection of client pools
@@ -412,7 +405,7 @@ class client_pool : public std::enable_shared_from_this<
   friend class client_pools;
 
   template <typename, typename>
-  friend class channel;
+  friend class load_blancer;
 
   template <typename T>
   async_simple::coro::Lazy<return_type_with_host<T>> send_request(
@@ -449,12 +442,11 @@ class client_pool : public std::enable_shared_from_this<
   coro_io::detail::client_queue<std::unique_ptr<client_t>>
       short_connect_clients_;
   client_pools_t* pools_manager_ = nullptr;
-  std::atomic<int> promise_cnt_ = 0;
-  moodycamel::ConcurrentQueue<std::shared_ptr<promise_handler>> promise_queue_;
   async_simple::Promise<async_simple::Unit> idle_timeout_waiter;
   std::string host_name_;
   pool_config pool_config_;
   io_context_pool_t& io_context_pool_;
+  std::atomic<bool> is_alive_ = true;
 };
 
 template <typename client_t,
