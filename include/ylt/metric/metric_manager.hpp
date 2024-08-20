@@ -69,63 +69,74 @@ class manager_helper {
   }
 #endif
 
-  static std::vector<std::shared_ptr<metric_t>> filter_metrics_by_label_value(
-      auto& metrics, const std::regex& label_regex, bool is_white) {
+  static std::vector<std::shared_ptr<metric_t>> filter_metrics_by_name(
+      auto& metrics, const std::regex& name_regex) {
     std::vector<std::shared_ptr<metric_t>> filtered_metrics;
-    std::vector<size_t> indexs;
-    size_t index = 0;
     for (auto& m : metrics) {
-      if (m->has_label_value(label_regex)) {
-        if (is_white) {
+      if (std::regex_match(m->str_name(), name_regex)) {
+        filtered_metrics.push_back(m);
+      }
+    }
+    return filtered_metrics;
+  }
+
+  static std::vector<std::shared_ptr<metric_t>> filter_metrics_by_label_name(
+      auto& metrics, const std::regex& label_name_regex) {
+    std::vector<std::shared_ptr<metric_t>> filtered_metrics;
+    for (auto& m : metrics) {
+      const auto& labels_name = m->labels_name();
+      for (auto& label_name : labels_name) {
+        if (std::regex_match(label_name, label_name_regex)) {
           filtered_metrics.push_back(m);
         }
-        else {
-          indexs.push_back(index);
-        }
       }
-
-      index++;
     }
+    return filtered_metrics;
+  }
 
-    if (!is_white) {
-      for (size_t i : indexs) {
-        metrics.erase(std::next(metrics.begin(), i));
+  static std::vector<std::shared_ptr<metric_t>> filter_metrics_by_label_value(
+      auto& metrics, const std::regex& label_value_regex) {
+    std::vector<std::shared_ptr<metric_t>> filtered_metrics;
+    for (auto& m : metrics) {
+      if (m->has_label_value(label_value_regex)) {
+        filtered_metrics.push_back(m);
       }
-      return metrics;
     }
-
     return filtered_metrics;
   }
 
   static std::vector<std::shared_ptr<metric_t>> filter_metrics(
       auto& metrics, const metric_filter_options& options) {
-    if (!options.name_regex && !options.label_regex) {
+    if (!(options.name_regex || options.label_regex ||
+          options.label_value_regex)) {
       return metrics;
     }
 
-    std::vector<std::shared_ptr<metric_t>> filtered_metrics;
-    for (auto& m : metrics) {
-      if (options.name_regex &&
-          !options.label_regex) {  // only check metric name
-        if (std::regex_match(std::string(m->name()), *options.name_regex)) {
-          filtered_metrics.push_back(m);
-        }
+    std::vector<std::shared_ptr<metric_t>> filtered_metrics = metrics;
+    if (options.name_regex) {
+      filtered_metrics = filter_metrics_by_name(metrics, *options.name_regex);
+      if (filtered_metrics.empty()) {
+        return {};
       }
-      else if (options.label_regex &&
-               !options.name_regex) {  // only check label name
-        filter_by_label_name(filtered_metrics, m, options);
+    }
+
+    if (options.label_regex) {
+      filtered_metrics =
+          filter_metrics_by_label_name(filtered_metrics, *options.label_regex);
+      if (filtered_metrics.empty()) {
+        return {};
       }
-      else {
-        if (std::regex_match(
-                std::string(m->name()),
-                *options.name_regex)) {  // check label name and label value
-          filter_by_label_name(filtered_metrics, m, options);
-        }
+    }
+
+    if (options.label_value_regex) {
+      filtered_metrics = filter_metrics_by_label_value(
+          filtered_metrics, *options.label_value_regex);
+      if (filtered_metrics.empty()) {
+        return {};
       }
     }
 
     if (!options.is_white) {
-      auto it = metrics.begin();
       for (auto& m : filtered_metrics) {
         std::erase_if(metrics, [&](auto t) {
           return t == m;
@@ -158,8 +169,8 @@ class static_metric_manager {
   static_metric_manager& operator=(static_metric_manager&&) = delete;
 
   static static_metric_manager<Tag>& instance() {
-    static static_metric_manager<Tag> inst;
-    return inst;
+    static auto* inst = new static_metric_manager<Tag>();
+    return *inst;
   }
 
   template <typename T, typename... Args>
@@ -239,17 +250,16 @@ class static_metric_manager {
     return metrics;
   }
 
-  std::vector<std::shared_ptr<metric_t>> filter_metrics_by_label_value(
-      const std::regex& label_regex, bool is_white = true) {
-    auto metrics = collect();
-    return manager_helper::filter_metrics_by_label_value(metrics, label_regex,
-                                                         is_white);
-  }
-
   std::vector<std::shared_ptr<metric_t>> filter_metrics_static(
       const metric_filter_options& options) {
     auto metrics = collect();
     return manager_helper::filter_metrics(metrics, options);
+  }
+
+  std::vector<std::shared_ptr<metric_t>> filter_metrics_by_label_value(
+      const std::regex& label_regex) {
+    auto metrics = collect();
+    return manager_helper::filter_metrics_by_label_value(metrics, label_regex);
   }
 
  private:
@@ -269,8 +279,8 @@ class dynamic_metric_manager {
   dynamic_metric_manager& operator=(dynamic_metric_manager&&) = delete;
 
   static dynamic_metric_manager<Tag>& instance() {
-    static dynamic_metric_manager<Tag> inst;
-    return inst;
+    static auto* inst = new dynamic_metric_manager<Tag>();
+    return *inst;
   }
 
   template <typename T, typename... Args>
@@ -350,14 +360,55 @@ class dynamic_metric_manager {
     }
   }
 
-  void remove_metric_by_label(
-      const std::vector<std::pair<std::string, std::string>>& labels) {
-    std::vector<std::string> label_value;
-    for (auto& [k, v] : labels) {
-      label_value.push_back(v);
+  void remove_label_value(const std::map<std::string, std::string>& labels) {
+    std::unique_lock lock(mtx_);
+    for (auto& [_, m] : metric_map_) {
+      m->remove_label_value(labels);
     }
+  }
 
-    remove_metric_by_label_value(label_value);
+  void remove_metric_by_label(
+      const std::map<std::string, std::string>& labels) {
+    std::unique_lock lock(mtx_);
+    for (auto it = metric_map_.begin(); it != metric_map_.end();) {
+      auto& m = it->second;
+      const auto& labels_name = m->labels_name();
+      if (labels.size() > labels_name.size()) {
+        continue;
+      }
+
+      if (labels.size() == labels_name.size()) {
+        std::vector<std::string> label_value;
+        for (auto& lb_name : labels_name) {
+          if (auto i = labels.find(lb_name); i != labels.end()) {
+            label_value.push_back(i->second);
+          }
+        }
+
+        std::erase_if(metric_map_, [&](auto& pair) {
+          return pair.second->has_label_value(label_value);
+        });
+        if (m->has_label_value(label_value)) {
+          metric_map_.erase(it);
+        }
+        break;
+      }
+      else {
+        bool need_erase = false;
+        for (auto& lb_name : labels_name) {
+          if (auto i = labels.find(lb_name); i != labels.end()) {
+            if (m->has_label_value(i->second)) {
+              it = metric_map_.erase(it);
+              need_erase = true;
+              break;
+            }
+          }
+        }
+
+        if (!need_erase)
+          ++it;
+      }
+    }
   }
 
   void remove_metric_by_label_name(
@@ -457,14 +508,47 @@ class dynamic_metric_manager {
   }
 
   std::vector<std::shared_ptr<metric_t>> filter_metrics_by_label_value(
-      const std::regex& label_regex, bool is_white = true) {
+      const std::regex& label_regex) {
     auto metrics = collect();
-    return manager_helper::filter_metrics_by_label_value(metrics, label_regex,
-                                                         is_white);
+    return manager_helper::filter_metrics_by_label_value(metrics, label_regex);
   }
 
  private:
-  dynamic_metric_manager() = default;
+  void clean_label_expired() {
+    executor_ = coro_io::create_io_context_pool(1);
+    timer_ = std::make_shared<coro_io::period_timer>(executor_->get_executor());
+    check_label_expired(timer_)
+        .via(executor_->get_executor())
+        .start([](auto&&) {
+        });
+  }
+
+  async_simple::coro::Lazy<void> check_label_expired(
+      std::weak_ptr<coro_io::period_timer> weak) {
+    while (true) {
+      auto timer = weak.lock();
+      if (timer == nullptr) {
+        co_return;
+      }
+
+      timer->expires_after(ylt_label_check_expire_duration);
+      bool r = co_await timer->async_await();
+      if (!r) {
+        co_return;
+      }
+
+      std::unique_lock lock(mtx_);
+      for (auto& [_, m] : metric_map_) {
+        m->clean_expired_label();
+      }
+    }
+  }
+
+  dynamic_metric_manager() {
+    if (ylt_label_max_age.count() > 0) {
+      clean_label_expired();
+    }
+  }
 
   std::vector<std::shared_ptr<dynamic_metric>> get_metric_by_label_value(
       const std::vector<std::string>& label_value) {
@@ -491,6 +575,8 @@ class dynamic_metric_manager {
 
   std::shared_mutex mtx_;
   std::unordered_map<std::string, std::shared_ptr<dynamic_metric>> metric_map_;
+  std::shared_ptr<coro_io::period_timer> timer_ = nullptr;
+  std::shared_ptr<coro_io::io_context_pool> executor_ = nullptr;
 };
 
 struct ylt_default_metric_tag_t {};
@@ -517,9 +603,15 @@ struct metric_collector_t {
     auto vec = get_all_metrics();
     return manager_helper::serialize_to_json(vec);
   }
+
+  static std::string serialize_to_json(
+      const std::vector<std::shared_ptr<metric_t>>& metrics) {
+    return manager_helper::serialize_to_json(metrics);
+  }
 #endif
 
-  static std::string serialize(std::vector<std::shared_ptr<metric_t>> metrics) {
+  static std::string serialize(
+      const std::vector<std::shared_ptr<metric_t>>& metrics) {
     return manager_helper::serialize(metrics);
   }
 
@@ -533,13 +625,6 @@ struct metric_collector_t {
       const metric_filter_options& options) {
     auto vec = get_all_metrics();
     return manager_helper::filter_metrics(vec, options);
-  }
-
-  static std::vector<std::shared_ptr<metric_t>> filter_metrics_by_label_value(
-      const std::regex& label_regex, bool is_white = true) {
-    auto vec = get_all_metrics();
-    return manager_helper::filter_metrics_by_label_value(vec, label_regex,
-                                                         is_white);
   }
 
  private:

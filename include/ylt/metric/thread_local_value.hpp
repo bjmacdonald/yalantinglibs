@@ -1,19 +1,20 @@
 #pragma once
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <thread>
 #include <vector>
 
 namespace ylt::metric {
-inline size_t get_round_index(size_t size) {
-  static std::atomic<size_t> round = 0;
-  static thread_local size_t index = round++;
+inline uint32_t get_round_index(uint32_t size) {
+  static std::atomic<uint32_t> round = 0;
+  static thread_local uint32_t index = round++;
   return index % size;
 }
 template <typename value_type>
 class thread_local_value {
  public:
-  thread_local_value(size_t dupli_count = std::thread::hardware_concurrency())
+  thread_local_value(uint32_t dupli_count = std::thread::hardware_concurrency())
       : duplicates_(dupli_count) {}
 
   ~thread_local_value() {
@@ -72,7 +73,7 @@ class thread_local_value {
   value_type reset() { return update(0); }
 
   auto &local_value() {
-    static thread_local auto index = get_round_index(duplicates_.size());
+    auto index = get_round_index(duplicates_.size());
     return get_value(index);
   }
 
@@ -98,7 +99,14 @@ class thread_local_value {
     return val;
   }
 
+  void set_created_time(std::chrono::system_clock::time_point tm) {
+    created_time_ = tm;
+  }
+
+  auto get_created_time() { return created_time_; }
+
  private:
   std::vector<std::atomic<std::atomic<value_type> *>> duplicates_;
+  std::chrono::system_clock::time_point created_time_{};
 };
 }  // namespace ylt::metric

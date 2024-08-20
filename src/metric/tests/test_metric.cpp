@@ -8,6 +8,9 @@ using namespace ylt;
 using namespace ylt::metric;
 
 struct metrc_tag {};
+
+struct test_tag {};
+
 TEST_CASE("test metric manager") {
   auto c = std::make_shared<counter_t>("test1", "");
   auto g = std::make_shared<gauge_t>("test2", "");
@@ -94,9 +97,27 @@ TEST_CASE("test metric manager") {
   CHECK(inst_d.metric_count() == 0);
   inst_d.register_metric(dc);
 
-  inst_d.remove_metric_by_label({{"url", "/"}, {"code", "200"}});
+  inst_d.remove_metric_by_label({{"code", "400"}});
+  CHECK(inst_d.metric_count() == 1);
+  inst_d.remove_metric_by_label({{"code", "200"}});
   CHECK(inst_d.metric_count() == 0);
   inst_d.register_metric(dc);
+
+  inst_d.remove_label_value({{"code", "400"}});
+  CHECK(inst_d.metric_count() == 1);
+  inst_d.remove_label_value({{"code", "200"}});
+  CHECK(dc->label_value_count() == 0);
+  dc->inc({"/", "200"});
+
+  CHECK(dc->label_value_count() == 1);
+  inst_d.remove_label_value({{"url", "/"}});
+  CHECK(dc->label_value_count() == 0);
+  dc->inc({"/", "200"});
+
+  CHECK(dc->label_value_count() == 1);
+  inst_d.remove_label_value({{"url", "/"}, {"code", "200"}});
+  CHECK(dc->label_value_count() == 0);
+  dc->inc({"/", "200"});
 
   inst_d.remove_metric_by_label_name(std::vector<std::string>{"url", "code"});
   CHECK(inst_d.metric_count() == 0);
@@ -110,7 +131,7 @@ TEST_CASE("test metric manager") {
   CHECK(inst_d.metric_count() == 0);
   inst_d.register_metric(dc);
 
-  inst_d.create_metric_dynamic<dynamic_counter_t>(
+  auto pair2 = inst_d.create_metric_dynamic<dynamic_counter_t>(
       "test4", "", std::array<std::string, 2>{"method", "code"});
 
   metric_filter_options options;
@@ -121,8 +142,14 @@ TEST_CASE("test metric manager") {
   auto v6 = inst_d.filter_metrics_dynamic(options);
   CHECK(v6.size() == 1);
 
-  auto v7 = inst_d.filter_metrics_by_label_value(std::regex("200"));
-  CHECK(v7.size() == 1);
+  options.label_value_regex = "200";
+
+  auto v7 = inst_d.filter_metrics_dynamic(options);
+  CHECK(v7.size() == 0);
+
+  pair2.second->inc({"200"});
+  auto v8 = inst_d.filter_metrics_dynamic(options);
+  CHECK(v8.size() == 1);
 }
 
 TEST_CASE("test dynamic counter") {
@@ -1260,6 +1287,11 @@ TEST_CASE("test serialize with emptry metrics") {
 }
 
 TEST_CASE("test serialize with multiple threads") {
+  {
+    dynamic_histogram_d h("test", "help", {5.23, 10.54, 20.0, 50.0, 100.0},
+                          std::array<std::string, 2>{"url", "code"});
+    h.observe({"/", "code"}, 23);
+  }
   auto c = std::make_shared<dynamic_counter_1t>(
       std::string("get_count"), std::string("get counter"),
       std::array<std::string, 1>{"method"});
@@ -1476,6 +1508,21 @@ TEST_CASE("testFilterMetricsDynamicWithMultiLabel") {
     auto metrics = metric_mgr::instance().filter_metrics_dynamic(options);
     CHECK(metrics.size() == 0);
   }
+}
+
+TEST_CASE("test metric manager clean expired label") {
+  set_label_max_age(std::chrono::seconds(1), std::chrono::seconds(1));
+  auto& inst = dynamic_metric_manager<test_tag>::instance();
+  auto pair = inst.create_metric_dynamic<dynamic_counter_1t>(
+      std::string("some_counter"), "", std::array<std::string, 1>{"url"});
+  auto c = pair.second;
+  c->inc({"/"});
+  c->inc({"/test"});
+  CHECK(c->label_value_count() == 2);
+  std::this_thread::sleep_for(std::chrono::seconds(2));
+  c->inc({"/index"});
+  size_t count = c->label_value_count();
+  CHECK(count == 1);
 }
 
 DOCTEST_MSVC_SUPPRESS_WARNING_WITH_PUSH(4007)

@@ -15,6 +15,7 @@
 #include "async_simple/coro/Lazy.h"
 #include "async_simple/coro/SyncAwait.h"
 #include "cinatra/cinatra_log_wrapper.hpp"
+#include "thread_local_value.hpp"
 #if __has_include("ylt/coro_io/coro_io.hpp")
 #include "ylt/coro_io/coro_io.hpp"
 #else
@@ -45,8 +46,27 @@ enum class MetricType {
 struct metric_filter_options {
   std::optional<std::regex> name_regex{};
   std::optional<std::regex> label_regex{};
+  std::optional<std::regex> label_value_regex{};
   bool is_white = true;
 };
+
+#ifdef __APPLE__
+inline double mac_os_atomic_fetch_add(std::atomic<double>* obj, double arg) {
+  double v;
+  do {
+    v = obj->load();
+  } while (!std::atomic_compare_exchange_weak(obj, &v, v + arg));
+  return v;
+}
+
+inline double mac_os_atomic_fetch_sub(std::atomic<double>* obj, double arg) {
+  double v;
+  do {
+    v = obj->load();
+  } while (!std::atomic_compare_exchange_weak(obj, &v, v - arg));
+  return v;
+}
+#endif
 
 class metric_t {
  public:
@@ -109,10 +129,14 @@ class metric_t {
     return static_labels_;
   }
 
+  virtual size_t label_value_count() { return 0; }
+
   virtual bool has_label_value(const std::string& label_value) {
     return std::find(labels_value_.begin(), labels_value_.end(), label_value) !=
            labels_value_.end();
   }
+
+  virtual void clean_expired_label() {}
 
   virtual bool has_label_value(const std::vector<std::string>& label_value) {
     return labels_value_ == label_value;
@@ -132,6 +156,9 @@ class metric_t {
     return std::find(labels_name_.begin(), labels_name_.end(), label_name) !=
            labels_name_.end();
   }
+
+  virtual void remove_label_value(
+      const std::map<std::string, std::string>& labels) {}
 
   virtual void serialize(std::string& str) {}
 
@@ -181,24 +208,6 @@ class metric_t {
     str.pop_back();
   }
 
-#ifdef __APPLE__
-  double mac_os_atomic_fetch_add(std::atomic<double>* obj, double arg) {
-    double v;
-    do {
-      v = obj->load();
-    } while (!std::atomic_compare_exchange_weak(obj, &v, v + arg));
-    return v;
-  }
-
-  double mac_os_atomic_fetch_sub(std::atomic<double>* obj, double arg) {
-    double v;
-    do {
-      v = obj->load();
-    } while (!std::atomic_compare_exchange_weak(obj, &v, v - arg));
-    return v;
-  }
-#endif
-
   MetricType type_ = MetricType::Nil;
   std::string name_;
   std::string help_;
@@ -216,13 +225,28 @@ class dynamic_metric : public metric_t {
   using metric_t::metric_t;
 };
 
-inline std::atomic<int64_t> g_user_metric_label_count = 0;
+inline auto g_user_metric_label_count = new thread_local_value<int64_t>(2);
 inline std::atomic<int64_t> g_summary_failed_count = 0;
 inline std::atomic<int64_t> g_user_metric_count = 0;
 
 inline std::atomic<int64_t> ylt_metric_capacity = 10000000;
+inline int64_t ylt_label_capacity = 20000000;
+
+inline std::chrono::seconds ylt_label_max_age{0};
+inline std::chrono::seconds ylt_label_check_expire_duration{0};
 
 inline void set_metric_capacity(int64_t max_count) {
   ylt_metric_capacity = max_count;
+}
+
+inline void set_label_capacity(int64_t max_label_count) {
+  ylt_label_capacity = max_label_count;
+}
+
+inline void set_label_max_age(
+    std::chrono::seconds max_age,
+    std::chrono::seconds check_duration = std::chrono::seconds(60 * 10)) {
+  ylt_label_max_age = max_age;
+  ylt_label_check_expire_duration = check_duration;
 }
 }  // namespace ylt::metric

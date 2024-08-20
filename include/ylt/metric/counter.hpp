@@ -32,7 +32,7 @@ inline void set_value(T &label_val, value_type value, op_type_t type) {
     case op_type_t::INC: {
 #ifdef __APPLE__
       if constexpr (std::is_floating_point_v<value_type>) {
-        mac_os_atomic_fetch_add(&label_val.local_value(), value);
+        mac_os_atomic_fetch_add(&label_val, value);
       }
       else {
         label_val += value;
@@ -72,13 +72,13 @@ class basic_static_counter : public static_metric {
   // static counter, contains a static labels with atomic value.
   basic_static_counter(std::string name, std::string help,
                        std::map<std::string, std::string> labels,
-                       size_t dupli_count = 2)
+                       uint32_t dupli_count = 2)
       : static_metric(MetricType::Counter, std::move(name), std::move(help),
                       std::move(labels)) {
     init_thread_local(dupli_count);
   }
 
-  void init_thread_local(size_t dupli_count) {
+  void init_thread_local(uint32_t dupli_count) {
     if (dupli_count > 0) {
       dupli_count_ = dupli_count;
       default_label_value_ = {dupli_count};
@@ -163,12 +163,12 @@ class basic_static_counter : public static_metric {
   }
 
   thread_local_value<value_type> default_label_value_;
-  size_t dupli_count_ = 2;
+  uint32_t dupli_count_ = 2;
 };
 
-template <size_t N>
+template <typename Key>
 struct array_hash {
-  size_t operator()(const std::array<std::string, N> &arr) const {
+  size_t operator()(const Key &arr) const {
     unsigned int seed = 131;
     unsigned int hash = 0;
 
@@ -185,11 +185,10 @@ struct array_hash {
 using counter_t = basic_static_counter<int64_t>;
 using counter_d = basic_static_counter<double>;
 
-template <typename T, size_t N>
-using dynamic_metric_hash_map =
-    std::unordered_map<std::array<std::string, N>, T, array_hash<N>>;
+template <typename Key, typename T>
+using dynamic_metric_hash_map = std::unordered_map<Key, T, array_hash<Key>>;
 
-template <typename value_type, size_t N>
+template <typename value_type, uint8_t N>
 class basic_dynamic_counter : public dynamic_metric {
  public:
   // dynamic labels value
@@ -210,20 +209,37 @@ class basic_dynamic_counter : public dynamic_metric {
       return;
     }
 
-    std::lock_guard lock(mtx_);
+    std::unique_lock lock(mtx_);
+    if (value_map_.size() > ylt_label_capacity) {
+      return;
+    }
     auto [it, r] = value_map_.try_emplace(
         labels_value, thread_local_value<value_type>(dupli_count_));
+    lock.unlock();
     if (r) {
-      g_user_metric_label_count++;  // TODO: use thread local
+      g_user_metric_label_count->local_value()++;
+      if (ylt_label_max_age.count()) {
+        it->second.set_created_time(std::chrono::system_clock::now());
+      }
     }
     set_value(it->second.local_value(), value, op_type_t::INC);
   }
 
   value_type update(const std::array<std::string, N> &labels_value,
                     value_type value) {
-    std::lock_guard lock(mtx_);
+    std::unique_lock lock(mtx_);
+    if (value_map_.size() > ylt_label_capacity) {
+      return value_type{};
+    }
     auto [it, r] = value_map_.try_emplace(
         labels_value, thread_local_value<value_type>(dupli_count_));
+    lock.unlock();
+    if (r) {
+      g_user_metric_label_count->local_value()++;
+      if (ylt_label_max_age.count()) {
+        it->second.set_created_time(std::chrono::system_clock::now());
+      }
+    }
     return it->second.update(value);
   }
 
@@ -247,14 +263,93 @@ class basic_dynamic_counter : public dynamic_metric {
     return val;
   }
 
-  dynamic_metric_hash_map<thread_local_value<value_type>, N> value_map() {
-    dynamic_metric_hash_map<thread_local_value<value_type>, N> map;
+  dynamic_metric_hash_map<std::array<std::string, N>,
+                          thread_local_value<value_type>>
+  value_map() {
+    dynamic_metric_hash_map<std::array<std::string, N>,
+                            thread_local_value<value_type>>
+        map;
     {
       std::lock_guard lock(mtx_);
       map = value_map_;
     }
 
     return map;
+  }
+
+  size_t label_value_count() override {
+    std::lock_guard lock(mtx_);
+    return value_map_.size();
+  }
+
+  void clean_expired_label() override {
+    if (ylt_label_max_age.count() == 0) {
+      return;
+    }
+
+    auto now = std::chrono::system_clock::now();
+    std::lock_guard lock(mtx_);
+    std::erase_if(value_map_, [&now](auto &pair) mutable {
+      bool r = std::chrono::duration_cast<std::chrono::seconds>(
+                   now - pair.second.get_created_time())
+                   .count() >= ylt_label_max_age.count();
+      return r;
+    });
+  }
+
+  void remove_label_value(
+      const std::map<std::string, std::string> &labels) override {
+    {
+      std::lock_guard lock(mtx_);
+      if (value_map_.empty()) {
+        return;
+      }
+    }
+
+    const auto &labels_name = this->labels_name();
+    if (labels.size() > labels_name.size()) {
+      return;
+    }
+
+    if (labels.size() == labels_name.size()) {
+      std::vector<std::string> label_value;
+      for (auto &lb_name : labels_name) {
+        if (auto i = labels.find(lb_name); i != labels.end()) {
+          label_value.push_back(i->second);
+        }
+      }
+
+      std::lock_guard lock(mtx_);
+      std::erase_if(value_map_, [&, this](auto &pair) {
+        return equal(label_value, pair.first);
+      });
+      return;
+    }
+    else {
+      std::vector<std::string> vec;
+      for (auto &lb_name : labels_name) {
+        if (auto i = labels.find(lb_name); i != labels.end()) {
+          vec.push_back(i->second);
+        }
+        else {
+          vec.push_back("");
+        }
+      }
+      if (vec.empty()) {
+        return;
+      }
+
+      std::lock_guard lock(mtx_);
+      std::erase_if(value_map_, [&](auto &pair) {
+        auto &[arr, _] = pair;
+        for (size_t i = 0; i < vec.size(); i++) {
+          if (!vec[i].empty() && vec[i] != arr[i]) {
+            return false;
+          }
+        }
+        return true;
+      });
+    }
   }
 
   bool has_label_value(const std::string &value) override {
@@ -286,7 +381,7 @@ class basic_dynamic_counter : public dynamic_metric {
 
   bool has_label_value(const std::vector<std::string> &label_value) override {
     std::array<std::string, N> arr{};
-    size_t size = (std::min)(N, label_value.size());
+    size_t size = (std::min)((size_t)N, label_value.size());
     for (size_t i = 0; i < size; i++) {
       arr[i] = label_value[i];
     }
@@ -361,6 +456,14 @@ class basic_dynamic_counter : public dynamic_metric {
     }
   }
 
+  template <class T, std::size_t Size>
+  bool equal(const std::vector<T> &v, const std::array<T, Size> &a) {
+    if (v.size() != N)
+      return false;
+
+    return std::equal(v.begin(), v.end(), a.begin());
+  }
+
   void build_string(std::string &str, const std::vector<std::string> &v1,
                     const auto &v2) {
     for (size_t i = 0; i < v1.size(); i++) {
@@ -370,7 +473,9 @@ class basic_dynamic_counter : public dynamic_metric {
   }
 
   std::mutex mtx_;
-  dynamic_metric_hash_map<thread_local_value<value_type>, N> value_map_;
+  dynamic_metric_hash_map<std::array<std::string, N>,
+                          thread_local_value<value_type>>
+      value_map_;
   size_t dupli_count_ = 2;
 };
 
