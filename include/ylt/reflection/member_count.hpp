@@ -4,10 +4,17 @@
 #include <tuple>
 #include <type_traits>
 #include <vector>
+#if __has_include(<ylt/util/expected.hpp>)
 #include <ylt/util/expected.hpp>
+#else
+#include "iguana/ylt/util/expected.hpp"
+#endif
 
 #include "user_reflect_macro.hpp"
-
+namespace struct_pack {
+template <typename T, uint64_t version>
+struct compatible;
+}
 namespace ylt::reflection {
 template <typename T>
 using remove_cvref_t = std::remove_cv_t<std::remove_reference_t<T>>;
@@ -43,7 +50,7 @@ constexpr bool expected = expected_impl<T>::value;
 
 #if __cpp_concepts >= 201907L
 template <typename Type>
-concept optional = requires(Type optional) {
+concept optional = !expected<Type> && requires(Type optional) {
   optional.value();
   optional.has_value();
   optional.operator*();
@@ -83,14 +90,12 @@ template <typename T>
 constexpr bool tuple_size = tuple_size_impl<T>::value;
 #endif
 
-template <typename T, uint64_t version = 0>
-struct compatible;
-
 template <typename Type>
 constexpr inline bool is_compatible_v = false;
 
 template <typename Type, uint64_t version>
-constexpr inline bool is_compatible_v<compatible<Type, version>> = true;
+constexpr inline bool is_compatible_v<struct_pack::compatible<Type, version>> =
+    true;
 
 struct UniversalVectorType {
   template <typename T>

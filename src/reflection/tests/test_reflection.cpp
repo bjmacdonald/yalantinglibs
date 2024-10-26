@@ -44,7 +44,7 @@ TEST_CASE("test member names") {
   constexpr size_t tp_size = std::tuple_size_v<decltype(tp)>;
   CHECK(tp_size == 5);
 
-  constexpr auto arr = member_names<person>;
+  constexpr auto arr = get_member_names<person>();
   for (auto name : arr) {
     std::cout << name << ", ";
   }
@@ -83,8 +83,8 @@ void test_pt() {
   static_assert(y == 4);
   CHECK(y == 4);
 
-#if __has_include(<concetps>)
-  constexpr auto x = get<"x"_ylts>(pt);
+#if __cplusplus >= 202002L
+  constexpr auto x = get<"x">(pt);
   static_assert(x == 2);
 #endif
 }
@@ -92,7 +92,7 @@ void test_pt() {
 TEST_CASE("test member value") {
   simple p{.color = 2, .id = 10, .str = "hello reflection", .age = 6};
   auto ref_tp = object_to_tuple(p);
-  constexpr auto arr = member_names<simple>;
+  constexpr auto arr = get_member_names<simple>();
   std::stringstream out;
   [&]<size_t... Is>(std::index_sequence<Is...>) {
     ((out << "name: " << arr[Is] << ", value: " << std::get<Is>(ref_tp)
@@ -118,11 +118,11 @@ TEST_CASE("test member value") {
   auto& age1 = get<int>(p, "age");
   CHECK(age1 == 6);
 
-#if __has_include(<concetps>)
-  auto& age2 = get<"age"_ylts>(p);
+#if __cplusplus >= 202002L
+  auto& age2 = get<"age">(p);
   CHECK(age2 == 6);
 
-  auto& var1 = get<"str"_ylts>(p);
+  auto& var1 = get<"str">(p);
   CHECK(var1 == "hello reflection");
 #endif
 
@@ -178,11 +178,11 @@ TEST_CASE("test member value") {
   constexpr std::string_view name2 = name_of<simple>(2);
   CHECK(name2 == "str");
 
-#if __has_include(<concetps>)
-  constexpr size_t idx = index_of<simple, "str"_ylts>();
+#if __cplusplus >= 202002L
+  constexpr size_t idx = index_of<simple, "str">();
   CHECK(idx == 2);
 
-  constexpr size_t idx2 = index_of<simple, "no_such"_ylts>();
+  constexpr size_t idx2 = index_of<simple, "no_such">();
   CHECK(idx2 == 4);
 #endif
 
@@ -305,7 +305,7 @@ YLT_REFL(simple2, color, id, str, age);
 TEST_CASE("test macros") {
   static_assert(!std::is_aggregate_v<simple2>);
   simple2 t{2, 10, "hello reflection", 6};
-  constexpr auto arr = member_names<simple2>;
+  constexpr auto arr = get_member_names<simple2>();
   static_assert(arr.size() == 4);
   constexpr auto map = member_names_map<simple2>;
   constexpr size_t index = map.at("age");
@@ -359,17 +359,17 @@ TEST_CASE("test macros") {
   auto var = get(t, 3);
   CHECK(*std::get<3>(var) == 6);
 
-#if __has_include(<concetps>)
-  auto& age2 = get<"age"_ylts>(t);
+#if __cplusplus >= 202002L
+  auto& age2 = get<"age">(t);
   CHECK(age2 == 6);
 
-  auto& var1 = get<"str"_ylts>(t);
+  auto& var1 = get<"str">(t);
   CHECK(var1 == "hello reflection");
 
-  constexpr size_t idx = index_of<simple2, "str"_ylts>();
+  constexpr size_t idx = index_of<simple2, "str">();
   CHECK(idx == 2);
 
-  constexpr size_t idx2 = index_of<simple2, "no_such"_ylts>();
+  constexpr size_t idx2 = index_of<simple2, "no_such">();
   CHECK(idx2 == 4);
 #endif
 
@@ -433,13 +433,13 @@ YLT_REFL_PRIVATE(private_struct, a, b);
 TEST_CASE("test visit private") {
   const Bank_t bank(1, "ok");
   constexpr auto tp = get_private_ptrs(identity<Bank_t>{});
-  refl_visit_members(bank, [](auto&... args) {
+  ylt::reflection::visit_members(bank, [](auto&... args) {
     ((std::cout << args << " "), ...);
     std::cout << "\n";
   });
 
   private_struct st(2, 4);
-  refl_visit_members(st, [](auto&... args) {
+  visit_members(st, [](auto&... args) {
     ((std::cout << args << " "), ...);
     std::cout << "\n";
   });

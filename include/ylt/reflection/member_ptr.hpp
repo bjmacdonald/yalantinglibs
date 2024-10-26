@@ -3,7 +3,7 @@
 
 // modified based on:
 // https://github.com/getml/reflect-cpp/blob/main/include/rfl/internal/bind_fake_object_to_tuple.hpp
-// thanks for alxn4's greate idea!
+// thanks for alxn4's great idea!
 namespace ylt::reflection {
 namespace internal {
 
@@ -84,7 +84,7 @@ inline constexpr remove_cvref_t<T>& get_fake_object() noexcept {
 #include "member_macro.hpp"
 
 template <class T>
-inline constexpr auto tuple_view(T& t) {
+inline constexpr auto tuple_view(T&& t) {
   return internal::object_tuple_view_helper<T, members_count_v<T>>::tuple_view(
       t);
 }
@@ -124,8 +124,8 @@ inline constexpr decltype(auto) visit_members(T&& t, Visitor&& visitor) {
                               std::forward<Visitor>(visitor));
   }
   else if constexpr (is_inner_ylt_refl_v<type>) {
-    return type::refl_object_to_tuple(std::forward<T>(t),
-                                      std::forward<Visitor>(visitor));
+    return t.refl_visit_members(std::forward<T>(t),
+                                std::forward<Visitor>(visitor));
   }
   else {
     return internal::tuple_view<Count>(std::forward<T>(t),
