@@ -92,7 +92,7 @@ runs:
         else
           report=ylt-cov-report
         fi
-        llvm-cov show $(find . -maxdepth 1 -type f -executable | awk '{print "-object " $0}' | xargs) -instr-profile=test_ylt.profdata -format=html -output-dir=$report -ignore-filename-regex='thirdparty|src|template_switch' -show-instantiations=false
+        llvm-cov show $(find . -maxdepth 1 -type f -executable | awk '{print "-object " $0}' | xargs) -instr-profile=test_ylt.profdata -format=html -output-dir=$report -ignore-filename-regex='thirdparty|src|template_switch|concurrentqueue|dragonbox_to_chars|dragonbox|expected' -show-instantiations=false
         echo "path=build/output/tests/$report" >> $GITHUB_OUTPUT
         cov_data=$(grep -w '<pre>Totals</pre>' $report/index.html | awk -F 'Totals' '{print $NF}' | cut -d ')' -f 2 | awk -F '>' '{print $NF}' | awk -F '%' '{print $1}')
         echo "coverage data: $cov_data"
@@ -105,17 +105,6 @@ runs:
       with:
         name: ${{ steps.get-cov-report.outputs.report }}
         path: ${{ steps.get-cov-report.outputs.path }}
-
-    - name: 'Create code coverage report and comment'
-      run: |
-        if [ -n "${{ inputs.reset-commit-id }}" ];then
-          title="Base Code Coverage Report"
-        else
-          title="Current PR Code Coverage Report"
-        fi
-        content=$(echo "for detail, [goto summary](https://github.com/${{ github.repository_owner }}/${{ github.event.repository.name }}/actions/runs/${{github.run_id}}) download Artifacts \`${{ steps.get-cov-report.outputs.report }}\`")
-        curl -L -X POST "https://api.github.com/repos/${{github.repository}}/issues/${{github.event.pull_request.number}}/comments" -H "Authorization: Bearer ${{github.token}}" -H 'Content-Type: application/json' -d "{\"body\": \"${title}\\n$content}\""
-      shell: bash
 
     - name: 'Checkout source code'
       uses: actions/checkout@v4

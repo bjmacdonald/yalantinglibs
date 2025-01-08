@@ -22,7 +22,7 @@
 name: Ubuntu 22.04 (llvm cov)
 
 on:
-  pull_request_target:
+  pull_request:
     branches:
       - main
       - fix_coverage_show
@@ -34,6 +34,7 @@ concurrency:
 jobs:
   prerequisites:
     runs-on: ubuntu-22.04
+    permissions: write-all
     outputs:
       id: ${{ steps.get-base-commit.outputs.id }}
     steps:
@@ -44,15 +45,21 @@ jobs:
           base_commit_id=$(curl -s -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" -H "Accept: application/vnd.github.v3+json" https://api.github.com/repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }} | jq -r .base.sha)
           echo "::set-output name=id::$base_commit_id"
         shell: bash
-        if: ${{ github.event_name == 'pull_request' }}
+      - name: 'Store Message'
+        run: |
+          mkdir -p ./msg
+          echo "action_id=${{github.run_id}}" >> ./msg/action_msg
+          echo "pr_id=${{github.event.pull_request.number}}" >> ./msg/action_msg
+        shell: bash
+      - name: 'Upload Action Message'
+        uses: actions/upload-artifact@v4
+        with:
+          name: action_msg
+          path: msg/
 
   base-cov-test:
     needs: prerequisites
     runs-on: ubuntu-22.04
-    permissions:
-      contents: read
-      issues: write
-      pull-requests: write
     outputs:
       data: ${{ steps.base-cov.outputs.data }}
     steps:
@@ -63,15 +70,10 @@ jobs:
         uses: ./.github/actions/coverage
         with:
           reset-commit-id: ${{ needs.prerequisites.outputs.id }}
-    if: ${{ github.event_name == 'pull_request' }}
 
   cov-test:
     needs: prerequisites
     runs-on: ubuntu-22.04
-    permissions:
-      contents: read
-      issues: write
-      pull-requests: write
     outputs:
       data: ${{ steps.cov.outputs.data }}
     steps:
@@ -103,4 +105,3 @@ jobs:
                 exit 1
             fi
         shell: bash
-        if: ${{ github.event_name == 'pull_request' }}

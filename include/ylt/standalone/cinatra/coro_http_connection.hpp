@@ -131,13 +131,24 @@ class coro_http_connection
         break;
       }
 
+      if (parser_.body_len() > max_http_body_len_ || parser_.body_len() < 0)
+          [[unlikely]] {
+        CINATRA_LOG_ERROR << "invalid http content length: "
+                          << parser_.body_len();
+        response_.set_status_and_content(status_type::bad_request,
+                                         "invalid http content length");
+        co_await reply();
+        close();
+        break;
+      }
+
       head_buf_.consume(size);
       keep_alive_ = check_keep_alive();
 
       auto type = request_.get_content_type();
 
       if (type != content_type::chunked && type != content_type::multipart) {
-        size_t body_len = parser_.body_len();
+        size_t body_len = (size_t)parser_.body_len();
         if (body_len == 0) {
           if (parser_.method() == "GET"sv) {
             if (request_.is_upgrade()) {
@@ -284,8 +295,9 @@ class coro_http_connection
                   }
                 }
                 // not found
-                if (!is_matched_regex_router)
+                if (!is_matched_regex_router) {
                   response_.set_status(status_type::not_found);
+                }
               }
             }
           }
@@ -294,10 +306,12 @@ class coro_http_connection
 
       if (!response_.get_delay()) {
         if (head_buf_.size()) {
-          if (type == content_type::multipart) {
-            response_.set_status_and_content(
-                status_type::not_implemented,
-                "mutipart handler not implemented or incorrect implemented");
+          if (type == content_type::multipart ||
+              type == content_type::chunked) {
+            if (response_.content().empty())
+              response_.set_status_and_content(
+                  status_type::not_implemented,
+                  "mutipart handler not implemented or incorrect implemented");
             co_await reply();
             close();
             CINATRA_LOG_ERROR
@@ -394,10 +408,6 @@ class coro_http_connection
       if (need_to_bufffer) {
         response_.to_buffers(buffers_, chunk_size_str_);
       }
-      int64_t send_size = 0;
-      for (auto &buf : buffers_) {
-        send_size += buf.size();
-      }
       std::tie(ec, size) = co_await async_write(buffers_);
     }
     else {
@@ -435,12 +445,21 @@ class coro_http_connection
     return remote_addr_;
   }
 
+  size_t available() {
+    std::error_code ec{};
+    return socket_.available(ec);
+  }
+
   void set_multi_buf(bool r) { multi_buf_ = r; }
 
   void set_default_handler(
       std::function<async_simple::coro::Lazy<void>(
           coro_http_request &, coro_http_response &)> &handler) {
     default_handler_ = handler;
+  }
+
+  void set_max_http_body_size(int64_t max_size) {
+    max_http_body_len_ = max_size;
   }
 
 #ifdef INJECT_FOR_HTTP_SEVER_TEST
@@ -597,7 +616,7 @@ class coro_http_connection
     std::string dest_buf;
     if (is_client_ws_compressed_ && msg.size() > 0) {
       if (!cinatra::gzip_codec::deflate(msg, dest_buf)) {
-        CINATRA_LOG_ERROR << "compuress data error, data: " << msg;
+        CINATRA_LOG_ERROR << "compress data error, data: " << msg;
         co_return std::make_error_code(std::errc::protocol_error);
       }
 
@@ -975,6 +994,7 @@ class coro_http_connection
       default_handler_ = nullptr;
   std::string chunk_size_str_;
   std::string remote_addr_;
+  int64_t max_http_body_len_ = 0;
 #ifdef INJECT_FOR_HTTP_SEVER_TEST
   bool write_failed_forever_ = false;
   bool read_failed_forever_ = false;

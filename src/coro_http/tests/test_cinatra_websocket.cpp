@@ -112,9 +112,45 @@ TEST_CASE("test websocket") {
           }
         }
       });
+  server.set_http_handler<cinatra::GET>(
+      "/test_client_timeout",
+      [](coro_http_request &req,
+         coro_http_response &resp) -> async_simple::coro::Lazy<void> {
+        CHECK(req.get_content_type() == content_type::websocket);
+        websocket_result result{};
+        while (true) {
+          result = co_await req.get_conn()->read_websocket();
+          if (result.ec) {
+            break;
+          }
+
+          std::this_thread::sleep_for(200ms);
+
+          auto ec = co_await req.get_conn()->write_websocket(result.data);
+          if (ec) {
+            break;
+          }
+        }
+      });
   server.async_start();
 
-  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  auto client_timeout = []() -> async_simple::coro::Lazy<void> {
+    coro_http_client client{};
+    client.set_req_timeout(50ms);
+    client.set_ws_sec_key("s//GYHa/XO7Hd2F2eOGfyA==");
+
+    auto r = co_await client.connect("ws://localhost:8090/test_client_timeout");
+    if (r.net_err) {
+      co_return;
+    }
+
+    co_await client.write_websocket("hello websocket");
+    auto data = co_await client.read_websocket();
+    std::cout << data.net_err.message() << std::endl;
+    CHECK(data.net_err == std::errc::timed_out);
+  };
+
+  async_simple::coro::syncAwait(client_timeout());
 
   coro_http_client client{};
   client.set_ws_sec_key("s//GYHa/XO7Hd2F2eOGfyA==");
@@ -241,10 +277,12 @@ TEST_CASE("test send after server stop") {
 
 TEST_CASE("test read write in different threads") {
   cinatra::coro_http_server server(1, 8090);
+  size_t count = 0;
+  std::promise<void> promise;
   server.set_http_handler<cinatra::GET>(
       "/",
-      [](coro_http_request &req,
-         coro_http_response &resp) -> async_simple::coro::Lazy<void> {
+      [&](coro_http_request &req,
+          coro_http_response &resp) -> async_simple::coro::Lazy<void> {
         CHECK(req.get_content_type() == content_type::websocket);
         websocket_result result{};
         while (true) {
@@ -252,7 +290,11 @@ TEST_CASE("test read write in different threads") {
           if (result.ec) {
             break;
           }
-
+          count++;
+          if (count == 100) {
+            promise.set_value();
+            break;
+          }
           auto ec = co_await req.get_conn()->write_websocket(result.data);
           if (ec) {
             break;
@@ -290,7 +332,7 @@ TEST_CASE("test read write in different threads") {
 
   async_simple::coro::syncAwait(lazy());
 
-  std::this_thread::sleep_for(std::chrono::milliseconds(300));
+  promise.get_future().wait_for(std::chrono::seconds(2));
 
   server.stop();
 }

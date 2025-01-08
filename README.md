@@ -43,9 +43,18 @@ You can also use cmake option `-DENABLE_CPP_20=ON` or `-DENABLE_CPP_20=OFF` to c
 
 ## Install & Compile
 
-Yalantinglibs is a head-only library. You can just copy `./include/ylt` directory into your project. But we suggest you use cmake to install it.
+### By Vcpkg
 
-### Install
+1. Install [vcpkg](https://github.com/microsoft/vcpkg)
+2. run `./vcpkg install yalantinglibs`
+3. If you use cmake, add those codes:
+```cmake
+find_package(yalantinglibs CONFIG REQUIRED)
+target_link_libraries(main PRIVATE yalantinglibs::yalantinglibs)
+```
+### Manually Install
+
+Yalantinglibs is a head-only library. You can just copy `./include/ylt` directory into your project. But we suggest you use cmake to install it.
 
 1. clone repo
 
@@ -73,6 +82,9 @@ bazel build ylt # Please make sure bazel in you bin path.
 bazel build coro_http_example # Or replace in anyone you want to build and test.
 # Actually you might take it in other project in prefix @com_alibaba_yalangtinglibs, like
 bazel build @com_alibaba_yalangtinglibs://ylt
+
+bazel version > 7
+bazel build ylt --enable_bzlmod
 ```
 
 You can see the test/example/benchmark executable file in `./build/output/`.
