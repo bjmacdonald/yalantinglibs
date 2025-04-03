@@ -47,6 +47,20 @@ inline void to_int(int num, char *p, int &size) {
     p[--size] = c;
 }
 
+inline std::tm localtime_safe(std::time_t timer) {
+  std::tm bt{};
+#if defined(__unix__)
+  localtime_r(&timer, &bt);
+#elif defined(_MSC_VER)
+  localtime_s(&bt, &timer);
+#else
+  static std::mutex mtx;
+  std::lock_guard<std::mutex> lock(mtx);
+  bt = *std::localtime(&timer);
+#endif
+  return bt;
+}
+
 inline char *get_time_str(const auto &now) {
   static thread_local char buf[33];
   static thread_local std::chrono::seconds last_sec_{};
@@ -63,7 +77,8 @@ inline char *get_time_str(const auto &now) {
 
   last_sec_ = s;
   auto tm = std::chrono::system_clock::to_time_t(now);
-  auto gmt = localtime(&tm);
+  auto ltm = localtime_safe(tm);
+  std::tm *gmt = &ltm;
 
   to_int<3, '.'>(mill_sec, buf, size);
   to_int<2, ':'>(gmt->tm_sec, buf, size);
@@ -164,7 +179,7 @@ class appender {
 
   template <bool sync = false, bool enable_console = false>
   void write_record(record_t &record) {
-    std::lock_guard guard(get_mutex<sync>());
+    std::unique_lock guard(get_mutex<sync>());
     if constexpr (sync == true) {
       if (max_files_ > 0 && file_size_ > max_file_size_ &&
           static_cast<size_t>(-1) != file_size_) {
@@ -189,6 +204,8 @@ class appender {
     write_file(msg);
 
     if constexpr (enable_console) {
+      guard.unlock();
+      std::unique_lock guard1(get_mutex<true>());
       add_color(record.get_severity());
       std::cout << time_str;
       clean_color(record.get_severity());
@@ -390,7 +407,7 @@ class appender {
   bool has_init_ = false;
   std::string filename_;
 
-  bool enable_console_ = false;
+  std::atomic<bool> enable_console_ = false;
   bool flush_every_time_;
   size_t file_size_ = 0;
   size_t max_file_size_ = 0;

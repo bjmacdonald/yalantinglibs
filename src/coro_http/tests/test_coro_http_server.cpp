@@ -13,12 +13,6 @@
 
 #include "async_simple/coro/Lazy.h"
 #include "async_simple/coro/SyncAwait.h"
-#include "cinatra/coro_http_client.hpp"
-#include "cinatra/coro_http_connection.hpp"
-#include "cinatra/coro_http_server.hpp"
-#include "cinatra/define.h"
-#include "cinatra/response_cv.hpp"
-#include "cinatra/utils.hpp"
 #include "doctest.h"
 #include "ylt/coro_http/coro_http_client.hpp"
 #include "ylt/coro_http/coro_http_server.hpp"
@@ -97,7 +91,7 @@ TEST_CASE("coro_io post") {
     std::rethrow_exception(t4.getException());
   } catch (const std::exception &e) {
     CHECK(e.what() == std::string("e"));
-    std::cout << e.what() << "\n";
+    CINATRA_LOG_DEBUG << e.what() << "\n";
   }
 }
 
@@ -134,13 +128,13 @@ TEST_CASE("coro_server example, will block") {
 
 template <typename View>
 bool create_file(View filename, size_t file_size = 1024) {
-  std::cout << "begin to open file: " << filename << "\n";
+  CINATRA_LOG_DEBUG << "begin to open file: " << filename << "\n";
   std::ofstream out(filename, std::ios::binary);
   if (!out.is_open()) {
-    std::cout << "open file: " << filename << " failed\n";
+    CINATRA_LOG_DEBUG << "open file: " << filename << " failed\n";
     return false;
   }
-  std::cout << "open file: " << filename << " ok\n";
+  CINATRA_LOG_DEBUG << "open file: " << filename << " ok\n";
   std::string str(file_size, 'A');
   out.write(str.data(), str.size());
   return true;
@@ -260,7 +254,7 @@ TEST_CASE("test range download") {
   create_file("中文测试.txt", 64);
   create_file(fs::path(u8"utf8中文.txt").string(), 64);
 #endif
-  std::cout << fs::current_path() << "\n";
+  CINATRA_LOG_DEBUG << fs::current_path() << "\n";
   coro_http_server server(1, 9001);
   server.set_static_res_dir("", "");
   server.set_file_resp_format_type(file_resp_format_type::range);
@@ -555,12 +549,12 @@ TEST_CASE("test alias") {
 
 struct log_t {
   bool before(coro_http_request &, coro_http_response &) {
-    std::cout << "before log" << std::endl;
+    CINATRA_LOG_DEBUG << "before log";
     return true;
   }
 
   bool after(coro_http_request &, coro_http_response &res) {
-    std::cout << "after log" << std::endl;
+    CINATRA_LOG_DEBUG << "after log";
     res.add_header("aaaa", "bbcc");
     return true;
   }
@@ -568,8 +562,16 @@ struct log_t {
 
 struct check_t {
   bool before(coro_http_request &, coro_http_response &) {
-    std::cout << "check before" << std::endl;
+    CINATRA_LOG_DEBUG << "check before";
     return true;
+  }
+};
+
+struct check_t1 {
+  bool before(coro_http_request &, coro_http_response &resp) {
+    CINATRA_LOG_DEBUG << "check1 before";
+    resp.set_status_and_content(status_type::bad_request, "check failed");
+    return false;
   }
 };
 
@@ -607,8 +609,13 @@ TEST_CASE("test aspects") {
         co_return;
       },
       get_data{});
+  server.set_http_handler<GET, POST>(
+      "/check1",
+      [](coro_http_request &req, coro_http_response &resp) {
+        resp.set_status_and_content(status_type::ok, "ok");
+      },
+      check_t1{}, log_t{});
   server.async_start();
-  std::this_thread::sleep_for(300ms);
 
   coro_http_client client{};
   auto result = client.get("http://127.0.0.1:9001/");
@@ -636,16 +643,14 @@ TEST_CASE("test aspects") {
 
   result = client.get("http://127.0.0.1:9001/aspect");
   CHECK(result.status == 200);
+
+  result = client.get("http://127.0.0.1:9001/check1");
+  CHECK(result.status == 400);
 }
 
 TEST_CASE("use out context") {
-  asio::io_context out_ctx;
-  auto work = std::make_unique<asio::io_context::work>(out_ctx);
-  std::thread thd([&] {
-    out_ctx.run();
-  });
-
-  cinatra::coro_http_server server(out_ctx, 9001);
+  auto executor = coro_io::get_global_executor()->get_asio_executor();
+  cinatra::coro_http_server server(executor.context(), 9001);
   server.set_http_handler<cinatra::GET, cinatra::POST>(
       "/out_ctx", [](coro_http_request &req, coro_http_response &resp) {
         resp.set_status_and_content(status_type::ok, "use out ctx");
@@ -662,9 +667,6 @@ TEST_CASE("use out context") {
   }
 
   server.stop();
-
-  work.reset();
-  thd.join();
 }
 
 TEST_CASE("delay reply, server stop, form-urlencode, qureies, throw") {
@@ -696,9 +698,32 @@ TEST_CASE("delay reply, server stop, form-urlencode, qureies, throw") {
         throw std::invalid_argument("invalid arguments");
         resp.set_status_and_content(status_type::ok, "ok");
       });
+  server.set_http_handler<cinatra::GET>(
+      "/coro_throw",
+      [](coro_http_request &req,
+         coro_http_response &resp) -> async_simple::coro::Lazy<void> {
+        CHECK(req.get_boundary().empty());
+        throw std::invalid_argument("invalid arguments");
+        resp.set_status_and_content(status_type::ok, "ok");
+        co_return;
+      });
+  server.set_http_handler<cinatra::GET>(
+      "/throw1", [](coro_http_request &req, coro_http_response &resp) {
+        CHECK(req.get_boundary().empty());
+        throw 1;
+        resp.set_status_and_content(status_type::ok, "ok");
+      });
+  server.set_http_handler<cinatra::GET>(
+      "/coro_throw1",
+      [](coro_http_request &req,
+         coro_http_response &resp) -> async_simple::coro::Lazy<void> {
+        CHECK(req.get_boundary().empty());
+        throw 1;
+        resp.set_status_and_content(status_type::ok, "ok");
+        co_return;
+      });
 
   server.async_start();
-  std::this_thread::sleep_for(200ms);
 
   resp_data result;
   coro_http_client client1{};
@@ -715,8 +740,16 @@ TEST_CASE("delay reply, server stop, form-urlencode, qureies, throw") {
   result = client1.get("http://127.0.0.1:9001/throw");
   CHECK(result.status == 503);
 
+  result = client1.get("http://127.0.0.1:9001/coro_throw");
+  CHECK(result.status == 503);
+
+  result = client1.get("http://127.0.0.1:9001/throw1");
+  CHECK(result.status == 503);
+
+  result = client1.get("http://127.0.0.1:9001/coro_throw1");
+  CHECK(result.status == 503);
+
   server.stop();
-  std::cout << "ok\n";
 }
 
 async_simple::coro::Lazy<resp_data> chunked_upload1(coro_http_client &client) {
@@ -763,8 +796,8 @@ TEST_CASE("chunked request") {
           content.append(result.data);
         }
 
-        std::cout << "content size: " << content.size() << "\n";
-        std::cout << content << "\n";
+        CINATRA_LOG_DEBUG << "content size: " << content.size() << "\n";
+        CINATRA_LOG_DEBUG << content << "\n";
         resp.set_format_type(format_type::chunked);
         resp.set_status_and_content(status_type::ok, "chunked ok");
       });
@@ -827,12 +860,12 @@ TEST_CASE("test websocket with chunked") {
           }
 
           if (result.type == ws_frame_type::WS_CLOSE_FRAME) {
-            std::cout << "close frame\n";
+            CINATRA_LOG_DEBUG << "close frame\n";
             CHECK(result.data.empty());
             break;
           }
 
-          std::cout << result.data.size() << "\n";
+          CINATRA_LOG_DEBUG << result.data.size() << "\n";
 
           if (result.data.size() < ws_chunk_size) {
             CHECK(result.data.size() == 24);
@@ -851,7 +884,7 @@ TEST_CASE("test websocket with chunked") {
         }
 
         CHECK(out_str.size() == 1024);
-        std::cout << out_str << "\n";
+        CINATRA_LOG_DEBUG << out_str << "\n";
       });
   server.async_start();
 
@@ -877,13 +910,13 @@ TEST_CASE("test websocket with chunked") {
 
   auto data = async_simple::coro::syncAwait(client.read_websocket());
   if (data.net_err) {
-    std::cout << "ws_msg net error " << data.net_err.message() << "\n";
+    CINATRA_LOG_DEBUG << "ws_msg net error " << data.net_err.message() << "\n";
     return;
   }
 
   size_t msg_len = data.resp_body.size();
 
-  std::cout << "ws msg len: " << msg_len << std::endl;
+  CINATRA_LOG_DEBUG << "ws msg len: " << msg_len;
   CHECK(!data.resp_body.empty());
   std::this_thread::sleep_for(300ms);
   server.stop();
@@ -906,7 +939,7 @@ TEST_CASE("test websocket") {
           }
 
           if (result.type == ws_frame_type::WS_CLOSE_FRAME) {
-            std::cout << "close frame\n";
+            CINATRA_LOG_DEBUG << "close frame\n";
             out_file.close();
             break;
           }
@@ -914,14 +947,14 @@ TEST_CASE("test websocket") {
           if (result.type == ws_frame_type::WS_TEXT_FRAME ||
               result.type == ws_frame_type::WS_BINARY_FRAME) {
             CHECK(!result.data.empty());
-            std::cout << result.data << "\n";
+            CINATRA_LOG_DEBUG << result.data << "\n";
             out_file << result.data;
           }
           else {
-            std::cout << result.data << "\n";
+            CINATRA_LOG_DEBUG << result.data << "\n";
             if (result.type == ws_frame_type::WS_PING_FRAME ||
                 result.type == ws_frame_type::WS_PONG_FRAME) {
-              std::cout << "ping or pong msg\n";
+              CINATRA_LOG_DEBUG << "ping or pong msg\n";
               // ping pong frame just need to continue, no need echo anything,
               // because framework has reply ping/pong to client automatically.
               continue;
@@ -945,7 +978,7 @@ TEST_CASE("test websocket") {
     coro_http_client client{};
     auto ret = co_await client.connect("ws://127.0.0.1:8003/ws_echo");
     if (ret.status != 101) {
-      std::cout << ret.net_err.message() << "\n";
+      CINATRA_LOG_DEBUG << ret.net_err.message() << "\n";
     }
     CHECK(ret.status == 101);
     co_await client.write_websocket(std::string_view("test2fdsaf"),
@@ -957,10 +990,13 @@ TEST_CASE("test websocket") {
     CHECK(data.resp_body == "test_ws");
     co_await client.write_websocket("PING", opcode::ping);
     data = co_await client.read_websocket();
-    CHECK(data.resp_body == "pong");
+    CHECK(data.resp_body == "PING");
+    co_await client.write_websocket("", opcode::ping);
+    data = co_await client.read_websocket();
+    CHECK(data.resp_body == "");
     co_await client.write_websocket("PONG", opcode::pong);
     data = co_await client.read_websocket();
-    CHECK(data.resp_body == "ping");
+    CHECK(data.resp_body == "PONG");
     co_await client.write_websocket_close("normal close");
     data = co_await client.read_websocket();
     CHECK(data.resp_body == "normal close");
@@ -1004,7 +1040,7 @@ TEST_CASE("test websocket binary data") {
           }
 
           if (result.type == ws_frame_type::WS_CLOSE_FRAME) {
-            std::cout << "close frame\n";
+            CINATRA_LOG_DEBUG << "close frame\n";
             CHECK(result.data.empty());
             break;
           }
@@ -1027,7 +1063,7 @@ TEST_CASE("test websocket binary data") {
           }
 
           if (result.type == ws_frame_type::WS_CLOSE_FRAME) {
-            std::cout << "close frame\n";
+            CINATRA_LOG_DEBUG << "close frame\n";
             CHECK(result.data.empty());
             break;
           }
@@ -1050,7 +1086,7 @@ TEST_CASE("test websocket binary data") {
           }
 
           if (result.type == ws_frame_type::WS_CLOSE_FRAME) {
-            std::cout << "close frame\n";
+            CINATRA_LOG_DEBUG << "close frame\n";
             CHECK(result.data.empty());
             break;
           }
@@ -1145,7 +1181,7 @@ TEST_CASE("test websocket with different message size") {
     coro_http_client client{};
     auto ret = co_await client.connect("ws://127.0.0.1:9008/ws_echo1");
     if (ret.status != 101) {
-      std::cout << ret.net_err.message() << "\n";
+      CINATRA_LOG_DEBUG << ret.net_err.message() << "\n";
     }
 
     CHECK(ret.status == 101);
@@ -1174,13 +1210,13 @@ TEST_CASE("test websocket with different message size") {
   }
 
   server.stop();
-  std::cout << "server stop" << std::endl;
+  CINATRA_LOG_DEBUG << "server stop";
 }
 
 #ifdef CINATRA_ENABLE_SSL
 TEST_CASE("test ssl server") {
   cinatra::coro_http_server server(1, 9001);
-  std::cout << std::filesystem::current_path() << "\n";
+  CINATRA_LOG_DEBUG << std::filesystem::current_path() << "\n";
   server.init_ssl("../openssl_files/server.crt", "../openssl_files/server.key",
                   "test");
   server.set_http_handler<GET, POST>(
@@ -1197,7 +1233,7 @@ TEST_CASE("test ssl server") {
   auto result = client.get("https://127.0.0.1:9001/ssl");
   CHECK(result.status == 200);
   CHECK(result.resp_body == "ssl");
-  std::cout << "ssl ok\n";
+  CINATRA_LOG_DEBUG << "ssl ok\n";
 }
 #endif
 
@@ -1266,13 +1302,63 @@ TEST_CASE("test restful api") {
         CHECK(req.matches_.str(2) == "200");
         response.set_status_and_content(status_type::ok, "number regex ok");
       });
+  server.set_http_handler<cinatra::GET, cinatra::POST>(
+      "/test4/{}", [](coro_http_request &req, coro_http_response &response) {
+        CHECK(req.matches_.str(1) == "100");
+        response.set_status_and_content(status_type::ok, "number regex ok");
+      });
 
   server.async_start();
-  std::this_thread::sleep_for(200ms);
 
   coro_http_client client;
-  client.get("http://127.0.0.1:9001/test2/name/test3/test");
-  client.get("http://127.0.0.1:9001/numbers/100/test/200");
+  auto result = client.get("http://127.0.0.1:9001/test2/name/test3/test");
+  result = client.get("http://127.0.0.1:9001/numbers/100/test/200");
+  result = client.get("http://127.0.0.1:9001/test4/100");
+  CHECK(result.status == 200);
+}
+
+TEST_CASE("test response standalone") {
+  coro_http_response resp(nullptr);
+  resp.set_status_and_content(status_type::ok, "ok");
+  CHECK(resp.content() == "ok");
+  CHECK(resp.content_size() == 2);
+  CHECK(resp.need_date());
+  resp.need_date_head(false);
+  CHECK(!resp.need_date());
+
+  std::string str;
+  resp.build_resp_str(str);
+  CHECK(!str.empty());
+  CHECK(str.find("200") != std::string::npos);
+  resp.clear();
+  str.clear();
+
+  resp.set_status_and_content(status_type::ok, "");
+  std::vector<http_header> v{{"hello", "world"}};
+  resp.add_header_span(v);
+  resp.build_resp_str(str);
+  CHECK(str.find("200") != std::string::npos);
+  resp.clear();
+  str.clear();
+
+  resp.set_keepalive(true);
+  resp.build_resp_str(str);
+  CHECK(str.find("501") != std::string::npos);
+  resp.set_format_type(format_type::chunked);
+  resp.build_resp_str(str);
+  CHECK(str.find("501") != std::string::npos);
+  resp.clear();
+  str.clear();
+
+  std::string_view out = "hello";
+  resp.set_status_and_content_view(status_type::ok, out);
+  resp.build_resp_str(str);
+  CHECK(str.find("200") != std::string::npos);
+
+  std::vector<asio::const_buffer> buffers;
+  resp.set_content_type<4>();
+  resp.build_resp_head(buffers);
+  CHECK(buffers.size() == 13);
 }
 
 TEST_CASE("test radix tree restful api") {
@@ -1423,17 +1509,17 @@ TEST_CASE("test reverse proxy") {
       "exception tests: empty hosts, empty weights test or count not equal") {
     cinatra::coro_http_server server(1, 9002);
     CHECK_THROWS_AS(server.set_http_proxy_handler<cinatra::http_method::GET>(
-                        "/", {}, coro_io::load_blance_algorithm::WRR, {2, 1}),
+                        "/", {}, coro_io::load_balance_algorithm::WRR, {2, 1}),
                     std::invalid_argument);
 
     CHECK_THROWS_AS(server.set_http_proxy_handler<cinatra::http_method::GET>(
                         "/", {"127.0.0.1:8801", "127.0.0.1:8802"},
-                        coro_io::load_blance_algorithm::WRR),
+                        coro_io::load_balance_algorithm::WRR),
                     std::invalid_argument);
 
     CHECK_THROWS_AS(server.set_http_proxy_handler<cinatra::http_method::GET>(
                         "/", {"127.0.0.1:8801", "127.0.0.1:8802"},
-                        coro_io::load_blance_algorithm::WRR, {1}),
+                        coro_io::load_balance_algorithm::WRR, {1}),
                     std::invalid_argument);
 
     CHECK_THROWS_AS(
@@ -1481,12 +1567,12 @@ TEST_CASE("test reverse proxy") {
   coro_http_server proxy_wrr(2, 8090);
   proxy_wrr.set_http_proxy_handler<GET, POST>(
       "/", {"127.0.0.1:9004", "127.0.0.1:9002", "127.0.0.1:9003"},
-      coro_io::load_blance_algorithm::WRR, {10, 5, 5}, log_t{}, check_t{});
+      coro_io::load_balance_algorithm::WRR, {10, 5, 5}, log_t{}, check_t{});
 
   coro_http_server proxy_rr(2, 8091);
   proxy_rr.set_http_proxy_handler<GET, POST>(
       "/", {"127.0.0.1:9004", "127.0.0.1:9002", "127.0.0.1:9003"},
-      coro_io::load_blance_algorithm::RR, {}, log_t{});
+      coro_io::load_balance_algorithm::RR, {}, log_t{});
 
   coro_http_server proxy_random(2, 8092);
   proxy_random.set_http_proxy_handler<GET, POST>(
@@ -1530,13 +1616,13 @@ TEST_CASE("test reverse proxy") {
 
   coro_http_client client_random;
   resp_data resp_random = client_random.get("http://127.0.0.1:8092/");
-  std::cout << resp_random.resp_body << "\n";
+  CINATRA_LOG_DEBUG << resp_random.resp_body << "\n";
   CHECK(!resp_random.resp_body.empty());
 
   coro_http_client client_all;
   resp_random = client_all.post("http://127.0.0.1:8093/", "test content",
                                 req_content_type::text);
-  std::cout << resp_random.resp_body << "\n";
+  CINATRA_LOG_DEBUG << resp_random.resp_body << "\n";
   CHECK(!resp_random.resp_body.empty());
 }
 
@@ -1590,7 +1676,7 @@ TEST_CASE("test reverse proxy download") {
 
   coro_http_server proxy_rr(2, 8001);
   proxy_rr.set_http_proxy_handler<GET, POST>(
-      "/([^]+)", {"127.0.0.1:9001"}, coro_io::load_blance_algorithm::RR);
+      "/([^]+)", {"127.0.0.1:9001"}, coro_io::load_balance_algorithm::RR);
   proxy_rr.async_start();
 
   coro_http_client client{};
@@ -1603,7 +1689,7 @@ TEST_CASE("test reverse proxy download") {
 
   coro_http_client client1{};
   result = client1.get("http://127.0.0.1:8001/test_multipart");
-  std::cout << result.net_err.message() << std::endl;
+  CINATRA_LOG_DEBUG << result.net_err.message();
   CHECK(result.status == 200);
   CHECK(result.resp_body == "hello world multipart");
 }
@@ -1648,7 +1734,7 @@ TEST_CASE("test reverse proxy websocket") {
   for (int i = 0; i < 10; i++) {
     async_simple::coro::syncAwait(client.write_websocket("test websocket"));
     auto data = async_simple::coro::syncAwait(client.read_websocket());
-    std::cout << data.resp_body << "\n";
+    CINATRA_LOG_DEBUG << data.resp_body << "\n";
     CHECK(data.resp_body == "test websocket");
   }
 }

@@ -43,6 +43,16 @@ You can also use cmake option `-DENABLE_CPP_20=ON` or `-DENABLE_CPP_20=OFF` to c
 
 ## Install & Compile
 
+### By Homebrew
+
+1. Install [homebrew](https://brew.sh/)
+2. run `brew install yalantinglibs`
+3. If you use cmake, add those codes:
+```cmake
+find_package(yalantinglibs CONFIG REQUIRED)
+target_link_libraries(main PRIVATE yalantinglibs::yalantinglibs)
+```
+
 ### By Vcpkg
 
 1. Install [vcpkg](https://github.com/microsoft/vcpkg)
@@ -262,7 +272,6 @@ struct person {
   std::string name;
   int age;
 };
-YLT_REFL(person, name, age);
 
 int main() {
   person p{.name = "tom", .age = 20};
@@ -286,7 +295,6 @@ struct person {
   std::string name;
   int age;
 };
-YLT_REFL(person, name, age);
 
 void basic_usage() {
   std::string xml = R"(
@@ -320,7 +328,6 @@ struct person {
   std::string name;
   int age;
 };
-YLT_REFL(person, name, age);
 
 void basic_usage() {
     // serialization the structure to the string
