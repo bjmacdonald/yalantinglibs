@@ -1655,6 +1655,7 @@ class coro_http_client : public std::enable_shared_from_this<coro_http_client> {
     }
 #endif
     if (parse_ret < 0) [[unlikely]] {
+      head_buf_.consume(head_buf_.size());
       return std::make_error_code(std::errc::protocol_error);
     }
 
@@ -1662,6 +1663,7 @@ class coro_http_client : public std::enable_shared_from_this<coro_http_client> {
         [[unlikely]] {
       CINATRA_LOG_ERROR << "invalid http content length: "
                         << parser_.body_len();
+      head_buf_.consume(head_buf_.size());
       return std::make_error_code(std::errc::invalid_argument);
     }
 
@@ -2036,12 +2038,9 @@ class coro_http_client : public std::enable_shared_from_this<coro_http_client> {
           << "start connect to endpoint lists. total endpoint count:"
           << eps->size()
           << ", the first endpoint is: " << (*eps)[0].address().to_string()
-          << std::to_string((*eps)[0].port());
+          << ":" << std::to_string((*eps)[0].port());
       std::error_code ec;
-      asio::ip::tcp::endpoint endpoint;
-      if (std::tie(ec, endpoint) = co_await coro_io::async_connect(
-              &executor_wrapper_, socket_->impl_, *eps);
-          ec) {
+      if (ec = co_await coro_io::async_connect(socket_->impl_, *eps); ec) {
         co_return resp_data{ec, 404};
       }
 #ifdef INJECT_FOR_HTTP_CLIENT_TEST
@@ -2084,9 +2083,10 @@ class coro_http_client : public std::enable_shared_from_this<coro_http_client> {
         }
       }
       socket_->has_closed_ = false;
-      CINATRA_LOG_TRACE << "connect to endpoint: "
-                        << endpoint.address().to_string() << ":"
-                        << std::to_string(endpoint.port()) << " successfully";
+      CINATRA_LOG_TRACE
+          << "connect to endpoint: "
+          << socket_->impl_.remote_endpoint().address().to_string() << ":"
+          << socket_->impl_.remote_endpoint().port() << " successfully";
     }
     co_return resp_data{};
   }
