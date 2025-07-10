@@ -30,12 +30,14 @@
 #include <mutex>
 #include <system_error>
 #include <thread>
+#include <tuple>
 #include <unordered_map>
 #include <vector>
 #include <ylt/easylog.hpp>
 
 #include "async_simple/Common.h"
 #include "async_simple/Promise.h"
+#include "async_simple/util/move_only_function.h"
 #include "common_service.hpp"
 #include "coro_connection.hpp"
 #include "ylt/coro_io/coro_io.hpp"
@@ -112,6 +114,9 @@ class coro_rpc_server_base {
     if (config.ssl_config) {
       init_ssl_context_helper(context_, config.ssl_config.value());
     }
+    else if (config.ibv_config) {
+      init_ibv(config.ibv_config);
+    }
 #endif
     init_address(config.address);
   }
@@ -124,6 +129,11 @@ class coro_rpc_server_base {
 #ifdef YLT_ENABLE_SSL
   void init_ssl(const ssl_configure &conf) {
     use_ssl_ = init_ssl_context_helper(context_, conf);
+  }
+#endif
+#ifdef YLT_ENABLE_IBV
+  void init_ibv(const coro_io::ib_socket_t::config_t &conf = {}) {
+    ibv_config_ = conf;
   }
 #endif
 
@@ -162,7 +172,7 @@ class coro_rpc_server_base {
       }
       errc_ = listen();
       if (!errc_) {
-        if constexpr (requires(typename server_config::executor_pool_t & pool) {
+        if constexpr (requires(typename server_config::executor_pool_t &pool) {
                         pool.run();
                       }) {
           thd_ = std::thread([this] {
@@ -179,7 +189,9 @@ class coro_rpc_server_base {
       async_simple::Promise<coro_rpc::err_code> promise;
       auto future = promise.getFuture();
       accept().start([this, p = std::move(promise)](auto &&res) mutable {
+        ELOG_INFO << "server quit!";
         if (res.hasError()) {
+          stop();
           errc_ = coro_rpc::err_code{coro_rpc::errc::io_error};
           p.setValue(errc_);
         }
@@ -240,6 +252,25 @@ class coro_rpc_server_base {
   uint16_t port() const { return port_; };
   std::string_view address() const { return address_; }
   coro_rpc::err_code get_errc() const { return errc_; }
+
+  template <typename... ServerType>
+  void add_subserver(
+      std::function<void(coro_io::socket_wrapper_t &&socket,
+                         std::string_view magic_number, ServerType &...server)>
+          dispatcher,
+      std::unique_ptr<ServerType>... server) {
+    connection_transfer_ = [dispatcher = std::move(dispatcher),
+                            server = std::make_tuple(std::move(server)...)](
+                               coro_io::socket_wrapper_t &&socket,
+                               std::string_view magic_number,
+                               int index = -1) mutable {
+      std::apply(
+          [&dispatcher, &socket, magic_number](auto &...server) {
+            dispatcher(std::move(socket), magic_number, *server...);
+          },
+          server);
+    };
+  }
 
   /*!
    * Register RPC service functions (member function)
@@ -389,7 +420,12 @@ class coro_rpc_server_base {
       }
 #endif
       if (error) {
-        ELOG_INFO << "accept failed, error: " << error.message();
+        if (error == asio::error::operation_aborted) {
+          ELOG_INFO << "server was canceled:" << error.message();
+        }
+        else {
+          ELOG_ERROR << "server accept failed:" << error.message();
+        }
         if (error == asio::error::operation_aborted ||
             error == asio::error::bad_descriptor) {
           acceptor_close_waiter_.set_value();
@@ -403,7 +439,30 @@ class coro_rpc_server_base {
       if (is_enable_tcp_no_delay_) {
         socket.set_option(asio::ip::tcp::no_delay(true), error);
       }
-      auto conn = std::make_shared<coro_connection>(executor, std::move(socket),
+      coro_io::socket_wrapper_t wrapper;
+      bool init_failed = false;
+      do {
+#ifdef YLT_ENABLE_SSL
+        if (use_ssl_) {
+          wrapper = {std::move(socket), executor, context_};
+          break;
+        }
+#endif
+#ifdef YLT_ENABLE_IBV
+        if (ibv_config_.has_value()) {
+          try {
+            wrapper = {std::move(socket), executor, *ibv_config_};
+          } catch (...) {
+            init_failed = true;
+          }
+          break;
+        }
+#endif
+        wrapper = {std::move(socket), executor};
+      } while (false);
+      if (init_failed)
+        continue;
+      auto conn = std::make_shared<coro_connection>(std::move(wrapper),
                                                     conn_timeout_duration_);
       conn->set_quit_callback(
           [this](const uint64_t &id) {
@@ -411,7 +470,9 @@ class coro_rpc_server_base {
             conns_.erase(id);
           },
           conn_id);
-
+      if (connection_transfer_) {
+        conn->set_transfer_callback(&connection_transfer_);
+      }
       {
         std::unique_lock lock(conns_mtx_);
         conns_.emplace(conn_id, conn);
@@ -421,11 +482,6 @@ class coro_rpc_server_base {
   }
 
   async_simple::coro::Lazy<void> start_one(auto conn) noexcept {
-#ifdef YLT_ENABLE_SSL
-    if (use_ssl_) {
-      conn->init_ssl(context_);
-    }
-#endif
     co_await conn->template start<typename server_config::rpc_protocol>(
         router_);
   }
@@ -478,9 +534,16 @@ class coro_rpc_server_base {
   coro_rpc::err_code errc_ = {};
   std::chrono::steady_clock::duration conn_timeout_duration_;
 
+  async_simple::util::move_only_function<void(coro_io::socket_wrapper_t &&soc,
+                                              std::string_view magic_number)>
+      connection_transfer_;
+
 #ifdef YLT_ENABLE_SSL
   asio::ssl::context context_{asio::ssl::context::sslv23};
   bool use_ssl_ = false;
+#endif
+#ifdef YLT_ENABLE_IBV
+  std::optional<coro_io::ib_socket_t::config_t> ibv_config_;
 #endif
 };
 }  // namespace coro_rpc

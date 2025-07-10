@@ -93,22 +93,115 @@ client.call<echo>("hello, coro_rpc");// The string literal can be converted to s
 
 ## 连接选项
 
-coro_rpc_client提供了`init_config`函数，用于配置连接选项。下面这份代码会列出可配置的选项。
+coro_rpc_client提供了`init_config`函数，用于配置连接选项。下面这份代码列出了可配置的选项。这些选项默认均可以不填写。
 
 ```cpp
 using namespace coro_rpc;
 using namespace std::chrono;
 void set_config(coro_rpc_client& client) {
+  uint64_t client_id;
+  std::chrono::milliseconds connect_timeout_duration;
+  std::chrono::milliseconds request_timeout_duration;
+  std::string host;
+  std::string port;
+  std::string local_ip;
   client.init_config(config{
-    .timeout_duration = 5s //请求和连接的超时时间
-    .host = "localhost" // 服务器域名
-    .port = "9001" // 服务器端口
-    .enable_tcp_no_delay  = true //是否禁止socket底层延迟发送请求
-    /*以下选项只在激活ssl支持后可用*/
-    .ssl_cert_path = "./server.crt" //ssl证书路径
-    .ssl_domain = "localhost" 
+    .connect_timeout_duration = 5s, // 连接的超时时间
+    .request_timeout_duration = 5s, // 请求超时时间
+    .host = "localhost", // 服务器域名
+    .port = "9001", // 服务器端口
+    .local_ip = "", // 本地ip，用于指定本地通信的ip地址。
+    .socket_config=std::variant<tcp_config,
+                 tcp_with_ssl_config,
+                 coro_io::ib_socket_t::config_t>{tcp_config{}}; // 指定底层的协议及其底层配置，目前支持tcp, ssl over tcp, rdma三种协议。
   });
 }
+```
+
+
+### rdma配置
+
+ibverbs协议的配置如下：
+```cpp
+struct ib_socket_t::config_t {
+  uint32_t cq_size = 128; // 事件通知队列的最大长度
+  uint32_t recv_buffer_cnt = 4;                 // 默认提交到接受队列的缓冲数目，一个缓冲区默认2m，因此一个rdma在连接成功后即占用8MB的内存。积压的接收数据越多，队列中的缓冲区也会越多，最多可以缓冲max_recv_wr*buffer_size这么多的数据(buffer_size为buffer_pool配置的缓冲区大小），此后如果上层仍不消费数据，则发送端会收到rnr错误，不断重试并等待对端消费。
+  ibv_qp_type qp_type = IBV_QPT_RC;             // 默认的qp类型。
+  ibv_qp_cap cap = {.max_send_wr = 1,           // 发送队列的最大长度。
+                    .max_recv_wr = 32,          // 接受队列的最大长度
+                    .max_send_sge = 3,          // 发送的最大地址分段数，在不启用inline data时只需要1个。使用inline data时数据可能不经过拷贝直接从原始分段地址发送，因此设置为3段（默认支持3段分散地址）。
+                    .max_recv_sge = 1,          // 接受的最大地址分段数，目前的缓冲区配置下只需要1个即可。
+                    .max_inline_data = 256};    // 如果发送的数据包小于inline data，且底层网卡支持该设置，则小数据包不会被拷贝到缓冲中，而是直接交给网卡发送。
+  std::shared_ptr<coro_io::ib_device_t> device; // rpc使用的底层ib网卡。默认选择设备列表第一个网卡。
+};
+```
+
+可以通过下面的代码简单的启用rdma：
+
+```cpp
+  coro_rpc_client cli;
+  cli.init_ibv(); //使用默认配置
+  cli.init_ibv(ib_socket_t::config_t{}); //使用用户指定的配置
+```
+
+也可以在配置中启用rdma：
+
+```cpp
+  coro_rpc_client cli;
+  cli.init_config(config{.socket_config=ib_socket_t::config_t{}})
+```
+
+
+#### ib_device_t
+
+`ib_device_t`管理了ibverbs传输过程中需要使用到的连接上下文和缓冲区。默认使用全局设备`coro_io::get_global_ib_device()`，用户也可以指定使用自己的设备。
+
+通过修改ib_device_t的配置，可以给rpc连接配置不同的网卡，使用独立的缓冲区。
+
+1. 修改默认的设备配置
+```cpp
+  // 配置只有在第一次调用时才会生效
+  coro_io::get_global_ib_device({ 
+    .buffer_pool_config = {
+      .buffer_size = 3 * 1024 * 1024,  // 缓冲区大小
+      .max_memory_usage = 20 * 1024 * 1024, // 最大内存使用量（超过此限制将分配失败）
+      .memory_usage_recorder = nullptr; // nullopt 表示不同设备的内存占用会被一起统计，如果想要让内存池具有独立的内存占用记录，请分配一个非空的std::shared_ptr<std::atomic<std::size_t>>作为记录
+      .idle_timeout = 5s // 空闲时间超过这个时长的缓冲区将被回收
+    }
+  }); 
+  // ...
+```
+
+2. 初始化连接时，指定需要使用的 RDMA 网卡
+```cpp
+  coro_rpc_client cli;
+  cli.init_ibv({
+    .device = coro_io::get_global_ib_device({.dev_name = "my_rmda_network_device_name"});
+  });
+```
+
+3. 创建并使用自己的 `ib_device_t`
+```cpp
+  auto dev = coro_io::ib_device_t::create({
+    .dev_name=nullptr,  // 如果 dev_name 为 nullptr，则会使用设备列表中的第一个设备
+    .buffer_pool_config = {
+      // ...
+    }
+  });
+  coro_rpc_client cli;
+  cli.init_ibv({
+    .device = dev
+  });
+```
+
+4. 查询当前所有成功注册的全局 RDMA 设备
+```cpp
+  // 获取所有设备
+  auto devices = coro_io::g_ib_device_manager();
+  for (auto &dev: devices.get_dev_list()) {
+    std::cout<<"name:"<<dev.first;
+    // dev.second 是一个全局的 std::shared_ptr<ib_device_t>
+  }
 ```
 
 ## 调用模型
@@ -262,3 +355,46 @@ Lazy<void> call() {
 单个coro_rpc_client在多个线程同时调用时需要注意，只有部分成员函数是线程安全的，包括`send_request()`,`close()`,`connect()`,`get_executor()`,`get_pipeline_size()`,`get_client_id()`,`get_config()`等。如果用户没有重新调用connect()函数并传入endpoint或hostname，那么`get_port()`,`get_host()`函数也是线程安全的。
 
 需要注意，`call`,`get_resp_attachment`,`set_req_attachment`,`release_resp_attachment`和`init_config`函数均不是线程安全的，禁止多个线程同时调用。此时只能使用`send_request`实现多个线程并发请求同一个连接。
+
+# coro_rpc 性能测试
+先编译coro_rpc 的bench再执行bench命令行，命令行详情：
+```
+options:
+  -u, --url                   url (string [=0.0.0.0:9000])
+  -s, --send_data_len         send data length (unsigned long [=8388608])
+  -c, --client_concurrency    total number of http clients (unsigned int [=0])
+  -m, --max_request_count     max request count (unsigned long [=100000000])
+  -p, --port                  server port (unsigned short [=9000])
+  -r, --resp_len              response data length (unsigned long [=13])
+  -b, --buffer_size           buffer size (unsigned int [=2097152])
+  -o, --log_level             Severity::INFO 1 as default, WARN is 4 (int [=1])
+  -i, --enable_ib             enable ib (bool [=1])
+  -d, --duration              duration seconds (unsigned int [=100000])
+  -?, --help                  print this message
+```
+
+server侧命令行：
+`./bench -p 9004 -r 13 -o 5`
+
+含义：启动服务端，response的数据长度为13，日志级别为error(日志级别和easylog的日志级别对应)。
+
+client测命令行：
+`./bench -u 0.0.0.0:9004 -c 100 -s 8388608 -o 5 -d 30`
+
+含义：启动100个client去压测，每次请求发送8MB数据，日志级别为error，持续时间30秒。
+
+默认会启用ibverbs，如果希望只测试tcp则添加`-i 0`
+
+性能测试完成之后将输出qps，吞吐和latency数据，测试结果类似于：
+```
+# Benchmark result
+avg qps 2757 and throughput:185.04 Gb/s in duration 30
+# HELP Latency(us) of rpc call help
+# TYPE Latency(us) of rpc call summary
+rpc call latency(us){quantile="0.500000"} 3616.000000
+rpc call latency(us){quantile="0.900000"} 3712.000000
+rpc call latency(us){quantile="0.950000"} 3776.000000
+rpc call latency(us){quantile="0.990000"} 3872.000000
+rpc call latency(us)_sum 298707968.000000
+rpc call latency(us)_count 82761
+```

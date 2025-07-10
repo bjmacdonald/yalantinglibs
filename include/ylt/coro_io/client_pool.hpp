@@ -194,7 +194,7 @@ class client_pool : public std::enable_shared_from_this<
         co_await coro_io::sleep_for(wait_time, &client->get_executor());
       self = watcher.lock();
       ++i;
-    } while (i < self->pool_config_.connect_retry_count);
+    } while (self && i < self->pool_config_.connect_retry_count);
     ELOG_WARN << "reconnect client{" << client.get() << "},host:{"
               << client->get_host() << ":" << client->get_port()
               << "} out of max limit, stop retry. connect failed";
@@ -220,7 +220,7 @@ class client_pool : public std::enable_shared_from_this<
         co_return;
       }
       auto executor = self->io_context_pool_.get_executor();
-      auto client = std::make_unique<client_t>(*executor);
+      auto client = std::make_unique<client_t>(executor);
       if (!client->init_config(client_config))
         AS_UNLIKELY {
           ELOG_ERROR << "Init client config failed in host alive detect. That "
@@ -271,7 +271,7 @@ class client_pool : public std::enable_shared_from_this<
     if (client == nullptr) {
       std::unique_ptr<client_t> cli;
       auto executor = io_context_pool_.get_executor();
-      client = std::make_unique<client_t>(*executor);
+      client = std::make_unique<client_t>(executor);
       if (!client->init_config(client_config))
         AS_UNLIKELY {
           ELOG_ERROR << "init client config failed.";
@@ -298,13 +298,24 @@ class client_pool : public std::enable_shared_from_this<
             this->weak_from_this(), clients,
             (std::max)(collect_time, std::chrono::milliseconds{50}),
             pool_config_.idle_queue_per_max_clear_count)
-            .directlyStart([](auto&&) {
-            },coro_io::get_global_executor());
+            .directlyStart(
+                [](auto&&) {
+                },
+                coro_io::get_global_executor());
       }
     }
   }
 
   void collect_free_client(std::unique_ptr<client_t> client) {
+    if (pool_config_.max_connection_life_time < std::chrono::seconds::max()) {
+      auto tp = client->get_create_time_point();
+      if (std::chrono::steady_clock::now() - tp >
+          pool_config_.max_connection_life_time) [[unlikely]] {
+        ELOG_INFO << "client{" << client.get()
+                  << "} live too long, we won't collect it";
+        return;
+      }
+    }
     if (!client->has_closed()) {
       if (free_clients_.size() < pool_config_.max_connection) {
         ELOG_TRACE << "collect free client{" << client.get() << "} enqueue";
@@ -359,6 +370,7 @@ class client_pool : public std::enable_shared_from_this<
         30000}; /* zero means wont detect */
     typename client_t::config client_config;
     std::chrono::seconds dns_cache_update_duration{5 * 60};  // 5mins
+    std::chrono::seconds max_connection_life_time = std::chrono::seconds::max();
   };
 
  private:
@@ -379,7 +391,9 @@ class client_pool : public std::enable_shared_from_this<
         pool_config_(pool_config),
         io_context_pool_(io_context_pool),
         free_clients_(pool_config.max_connection),
-        eps_(std::make_shared<std::vector<asio::ip::tcp::endpoint>>()){};
+        eps_(std::make_shared<std::vector<asio::ip::tcp::endpoint>>()) {
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+  };
 
   client_pool(private_construct_token t, client_pools_t* pools_manager_,
               std::string_view host_name, const pool_config& pool_config,
@@ -389,7 +403,9 @@ class client_pool : public std::enable_shared_from_this<
         pool_config_(pool_config),
         io_context_pool_(io_context_pool),
         free_clients_(pool_config.max_connection),
-        eps_(std::make_shared<std::vector<asio::ip::tcp::endpoint>>()){};
+        eps_(std::make_shared<std::vector<asio::ip::tcp::endpoint>>()) {
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+  };
 
   template <typename T>
   async_simple::coro::Lazy<return_type<T>> send_request(

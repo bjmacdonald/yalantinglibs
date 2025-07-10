@@ -88,24 +88,116 @@ client.call<echo>("", 0); // Extra parameters, compilation error
 client.call<echo>("hello, coro_rpc"); // The string literal can be converted to std::string, compilation succeeds
 ```
 
-## Connect Option
+## Connection Options
 
-The `coro_rpc_client` provides an `init_config` function for configuring connection options. The following code snippet lists the configurable options.
+The `coro_rpc_client` provides an `init_config` function to configure connection options. The code below lists all configurable options, which are optional with default values.
 
 ```cpp
 using namespace coro_rpc;
 using namespace std::chrono;
 void set_config(coro_rpc_client& client) {
+  uint64_t client_id;
+  std::chrono::milliseconds connect_timeout_duration;
+  std::chrono::milliseconds request_timeout_duration;
+  std::string host;
+  std::string port;
+  std::string local_ip;
   client.init_config(config{
-    .timeout_duration = 5s, // Timeout duration for requests and connections
+    .connect_timeout_duration = 5s, // Connection timeout duration
+    .request_timeout_duration = 5s, // Request timeout duration
     .host = "localhost", // Server hostname
     .port = "9001", // Server port
-    .enable_tcp_no_delay = true, // Whether to disable socket-level delayed sending of requests
-    /* The following options are available only when SSL support is activated */
-    .ssl_cert_path = "./server.crt", // Path to the SSL certificate
-    .ssl_domain = "localhost"
+    .local_ip = "", // Local IP address used to specify the local communication interface
+    .socket_config=std::variant<tcp_config,
+                 tcp_with_ssl_config,
+                 coro_io::ib_socket_t::config_t>{tcp_config{}}; // Specify transport protocol and its configuration. Supported protocols: TCP, SSL over TCP, RDMA
   });
 }
+```
+
+### RDMA Socket Configuration
+
+The configuration for IBVerbs socket protocol is shown below:
+
+```cpp
+struct ib_socket_t::config_t {
+  uint32_t cq_size = 128; // Maximum length of event notification queue
+  uint32_t recv_buffer_cnt = 4;                 // Number of buffers pre-submitted to receive queue. Each buffer defaults to 2MB, so a RDMA connection occupies 8MB memory immediately after establishment. More pending receive data will result in more buffers in the queue, up to max_recv_wr*buffer_size (where buffer_size is configured in buffer_pool). If upper layer doesn't consume data, sender will receive RNR (Receiver Not Ready) errors and retry continuously.
+  ibv_qp_type qp_type = IBV_QPT_RC;             // Default QP type
+  ibv_qp_cap cap = {.max_send_wr = 1,           // Maximum send queue length
+                    .max_recv_wr = 32,          // Maximum receive queue length
+                    .max_send_sge = 3,          // Maximum send scatter/gather elements. Only 1 needed without inline data. Use 3 segments when using inline data (default supports 3 scattered addresses)
+                    .max_recv_sge = 1,          // Maximum receive scatter/gather elements. 1 suffices with current buffer configuration
+                    .max_inline_data = 256};    // If packet size < inline data threshold and NIC supports it, small packets bypass buffer copy and go directly to NIC
+  std::shared_ptr<coro_io::ib_device_t> device; // Underlying IB device for RPC. Defaults to first device in list
+};
+```
+
+Simple RDMA activation examples:
+
+```cpp
+  coro_rpc_client cli;
+  cli.init_ibv(); // Use default configuration
+  cli.init_ibv({.recv_buffer_cnt=8}); // Use custom configuration
+```
+
+RDMA activation through config:
+
+```cpp
+  coro_rpc_client cli;
+  cli.init_config(config{.socket_config=ib_socket_t::config_t{}})
+```
+
+#### RDMA Device Configuration
+
+The `ib_device_t` manages the connection context and buffers required during the ibverbs transmission process. By default, it uses the global device `coro_io::get_global_ib_device()`, but users can also specify their own device.
+
+By modifying the configuration of `ib_device_t`, users can assign different network interfaces to RPC connections and use separate buffers.
+
+1. Modify the default device configuration
+```cpp
+  // The configuration only takes effect on the first invocation
+  coro_io::get_global_ib_device({ 
+    .buffer_pool_config = {
+      .buffer_size = 3 * 1024 * 1024,  // Buffer size
+      .max_memory_usage = 20 * 1024 * 1024, // Max memory usage (allocation fails beyond this limit)
+      .memory_usage_recorder = nullptr; // nullopt means that memory usage across different devices will be counted together. If you want the memory pool to have independent memory usage tracking, you should assign a non-null std::shared_ptr<std::atomic<std::size_t>> as the recorder.
+      .idle_timeout = 5s // Buffers unused for this duration will be reclaimed
+    }
+  }); 
+  // ...
+```
+
+2. Specify the RDMA NIC to use when initializing the connection
+```cpp
+  coro_rpc_client cli;
+  cli.init_ibv({
+    .device = coro_io::get_global_ib_device({.dev_name = "my_rmda_network_device_name"});
+  });
+```
+
+3. Create and use your own `ib_device_t`
+```cpp
+  auto dev = coro_io::ib_device_t::create({
+    .dev_name = nullptr,  // If dev_name is nullptr, it will use the first device in list
+    .buffer_pool_config = {
+      // ...
+    }
+  });
+  coro_rpc_client cli;
+  cli.init_ibv({
+    .device = dev
+  });
+```
+
+4. Query all currently successfully registered RDMA global devices
+```cpp
+  // Get all devices
+  auto devices = coro_io::g_ib_device_manager();
+  for (auto &dev: devices.get_dev_list()) {
+    std::cout << "name:" << dev.first;
+    // dev.second is a global std::shared_ptr<ib_device_t>
+  }
 ```
 
 ## Calling Model

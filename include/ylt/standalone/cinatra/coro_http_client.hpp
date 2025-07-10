@@ -2,6 +2,7 @@
 #include <atomic>
 #include <cassert>
 #include <charconv>
+#include <chrono>
 #include <cstddef>
 #include <filesystem>
 #include <fstream>
@@ -142,7 +143,8 @@ class coro_http_client : public std::enable_shared_from_this<coro_http_client> {
         timer_(&executor_wrapper_),
         socket_(std::make_shared<socket_t>(executor)),
         head_buf_(socket_->head_buf_),
-        chunked_buf_(socket_->chunked_buf_) {}
+        chunked_buf_(socket_->chunked_buf_),
+        create_tp_(std::chrono::steady_clock::now()) {}
 
   coro_http_client(
       coro_io::ExecutorWrapper<> *executor = coro_io::get_global_executor())
@@ -181,6 +183,10 @@ class coro_http_client : public std::enable_shared_from_this<coro_http_client> {
   }
 
   ~coro_http_client() { close(); }
+
+  auto get_create_time_point() const noexcept {
+    return std::chrono::steady_clock::now();
+  }
 
   void close() {
     if (socket_ == nullptr || socket_->has_closed_)
@@ -1655,6 +1661,7 @@ class coro_http_client : public std::enable_shared_from_this<coro_http_client> {
     }
 #endif
     if (parse_ret < 0) [[unlikely]] {
+      head_buf_.consume(head_buf_.size());
       return std::make_error_code(std::errc::protocol_error);
     }
 
@@ -1662,6 +1669,7 @@ class coro_http_client : public std::enable_shared_from_this<coro_http_client> {
         [[unlikely]] {
       CINATRA_LOG_ERROR << "invalid http content length: "
                         << parser_.body_len();
+      head_buf_.consume(head_buf_.size());
       return std::make_error_code(std::errc::invalid_argument);
     }
 
@@ -2036,12 +2044,9 @@ class coro_http_client : public std::enable_shared_from_this<coro_http_client> {
           << "start connect to endpoint lists. total endpoint count:"
           << eps->size()
           << ", the first endpoint is: " << (*eps)[0].address().to_string()
-          << std::to_string((*eps)[0].port());
+          << ":" << std::to_string((*eps)[0].port());
       std::error_code ec;
-      asio::ip::tcp::endpoint endpoint;
-      if (std::tie(ec, endpoint) = co_await coro_io::async_connect(
-              &executor_wrapper_, socket_->impl_, *eps);
-          ec) {
+      if (ec = co_await coro_io::async_connect(socket_->impl_, *eps); ec) {
         co_return resp_data{ec, 404};
       }
 #ifdef INJECT_FOR_HTTP_CLIENT_TEST
@@ -2084,9 +2089,10 @@ class coro_http_client : public std::enable_shared_from_this<coro_http_client> {
         }
       }
       socket_->has_closed_ = false;
-      CINATRA_LOG_TRACE << "connect to endpoint: "
-                        << endpoint.address().to_string() << ":"
-                        << std::to_string(endpoint.port()) << " successfully";
+      CINATRA_LOG_TRACE
+          << "connect to endpoint: "
+          << socket_->impl_.remote_endpoint().address().to_string() << ":"
+          << socket_->impl_.remote_endpoint().port() << " successfully";
     }
     co_return resp_data{};
   }
@@ -2463,6 +2469,7 @@ class coro_http_client : public std::enable_shared_from_this<coro_http_client> {
       std::chrono::seconds(30);
   std::chrono::steady_clock::duration req_timeout_duration_ =
       std::chrono::seconds(60);
+  std::chrono::steady_clock::time_point create_tp_;
   bool enable_tcp_no_delay_ = true;
   std::string resp_chunk_str_;
   std::span<char> out_buf_;

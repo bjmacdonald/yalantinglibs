@@ -8,8 +8,6 @@
 <img alt="last commit" src="https://img.shields.io/github/last-commit/alibaba/async_simple?style=flat-square">
 </p>
 
-[中文版](../../zh/guide/what_is_yalantinglibs.md)
-
 yaLanTingLibs is a collection of modern c++ util libraries, now it contains struct_pack, struct_json, struct_xml, struct_yaml, struct_pb, easylog, coro_rpc, coro_io, coro_http and async_simple, more and more cool libraries will be added into yaLanTingLibs in the future.
 
 The target of yaLanTingLibs: provide very easy and high performance modern C++ libraries for developers, it can help to quickly build high performance applications.
@@ -43,9 +41,69 @@ You can also use cmake option `-DENABLE_CPP_20=ON` or `-DENABLE_CPP_20=OFF` to c
 
 ## Install & Compile
 
-Yalantinglibs is a head-only library. You can just copy `./include/ylt` directory into your project. But we suggest you use cmake to install it.
+### By Homebrew
 
-### Install
+1. Install [homebrew](https://brew.sh/)
+2. run `brew install yalantinglibs`
+3. If you use cmake, add those codes:
+```cmake
+find_package(yalantinglibs CONFIG REQUIRED)
+target_link_libraries(main PRIVATE yalantinglibs::yalantinglibs)
+```
+
+### By Vcpkg
+
+1. Install [vcpkg](https://github.com/microsoft/vcpkg)
+2. run `./vcpkg install yalantinglibs`
+3. If you use cmake, add those codes:
+```cmake
+find_package(yalantinglibs CONFIG REQUIRED)
+target_link_libraries(main PRIVATE yalantinglibs::yalantinglibs)
+```
+
+### Cmake FetchContent
+
+You can also import ylt by cmake FetchContent
+
+```cmake
+cmake_minimum_required(VERSION 3.15)
+project(ylt_test)
+
+include(FetchContent)
+
+FetchContent_Declare(
+    yalantinglibs
+    GIT_REPOSITORY https://github.com/alibaba/yalantinglibs.git
+    GIT_TAG main
+    GIT_SHALLOW 1 # optional ( --depth=1 )
+)
+
+FetchContent_MakeAvailable(yalantinglibs)
+add_executable(main main.cpp)
+
+target_link_libraries(main yalantinglibs::yalantinglibs)
+target_compile_features(main PRIVATE cxx_std_20)
+```
+
+### Cmake add_subdirectory
+
+1. download ylt source code and put it in your project
+2. add ylt to your project as subdirectory:
+
+```cmake
+cmake_minimum_required(VERSION 3.15)
+project(ylt_test)
+
+add_subdirectory(yalantinglibs)  # you may modify the path as the real relative path in your project
+add_executable(main main.cpp)
+
+target_link_libraries(main yalantinglibs::yalantinglibs)
+target_compile_features(main PRIVATE cxx_std_20)
+```
+
+### Manually Install & Import
+
+Yalantinglibs is a head-only library. You can just copy `./include/ylt` directory into your project. But we suggest you use cmake to install it.
 
 1. clone repo
 
@@ -65,15 +123,6 @@ cmake ..
 cmake --build . --config debug # add -j, if you have enough memory to parallel compile
 ctest . # run tests
 
-```
-
-- Build in bazel:
-```shell
-bazel build ylt # Please make sure bazel in you bin path.
-bazel build coro_http_example # Or replace in anyone you want to build and test.
-# Actually you might take it in other project in prefix @com_alibaba_yalangtinglibs, like
-bazel build @com_alibaba_yalangtinglibs://ylt
-```
 
 You can see the test/example/benchmark executable file in `./build/output/`.
 
@@ -81,7 +130,7 @@ You can see the test/example/benchmark executable file in `./build/output/`.
 
 ```shell
 # You can use those option to skip build unit-test & benchmark & example: 
-cmake .. -DBUILD_EXAMPLES=OFF -DBUILD_BENCHMARK=OFF -DBUILD_UNIT_TESTS=OFF
+cmake .. -DBUILD_EXAMPLES=OFF -DBUILD_BENCHMARK=OFF -DBUILD_UNIT_TESTS=OFF -DGENERATE_BENCHMARK_DATA=OFF
 ```
 
 3. install
@@ -92,7 +141,7 @@ cmake --install . # --prefix ./user_defined_install_path
 
 4. start develop
 
-- Use Cmake:
+- start by example:
 
 After install ylt, copy then open the directory `src/*/examples`, then:
 
@@ -103,39 +152,23 @@ cmake ..
 cmake --build .
 ```
 
-### Cmake FetchContent
-
-You can also import ylt by cmake FetchContent
+- import ylt to your project by cmake
 
 ```cmake
-cmake_minimum_required(VERSION 3.15)
-project(ylt_test)
-
-include(FetchContent)
-
-FetchContent_Declare(
-    yalantinglibs
-    GIT_REPOSITORY https://github.com/JYLeeLYJ/yalantinglibs.git
-    GIT_TAG feat/fetch # optional ( default master / main )
-    GIT_SHALLOW 1 # optional ( --depth=1 )
-)
-
-FetchContent_MakeAvailable(yalantinglibs)
-add_executable(main main.cpp)
-
-target_link_libraries(main yalantinglibs::yalantinglibs)
-target_compile_features(main PRIVATE cxx_std_20)
+find_package(yalantinglibs CONFIG REQUIRED)
+target_link_libraries(main PRIVATE yalantinglibs::yalantinglibs)
 ```
 
-### Compile Manually:
+
+- import ylt in your project Manually if you don't want to use cmake:
 
 1. Add `include/` directory to include path(skip it if you have install ylt into default include path).
 2. Add `include/ylt/thirdparty` to include path(skip it if you have install ylt by cmake).
 3. Add `include/ylt/standalone` to include path(skip it if you have install ylt by cmake).
-4. Enable `c++20` standard by option `-std=c++20`(g++/clang++) or `/std:c++20`(msvc). The serialization and log libraries need at least c++17, the network and coroutine libraries need at least c++20.
-5. If you use any header with `coro_` prefix, add link option `-pthread` in linux, add option `-fcoroutines` when you use g++10.
+4. Enable `c++20` standard by option `-std=c++20`(g++/clang++) or `/std:c++20`(msvc)
+5. Add link option `-pthread`,`-ldl` when you use g++, add option `-fcoroutines` when you use g++10.
 
-### More Details:
+#### More Details:
 For more details, see the cmake file [here](https://github.com/alibaba/yalantinglibs/blob/main/CMakeLists.txt) and [there](https://github.com/alibaba/yalantinglibs/tree/main/cmake).
 
 # Introduction
@@ -250,7 +283,9 @@ struct person {
   std::string name;
   int age;
 };
-YLT_REFL(person, name, age);
+
+// static reflection works in C++20. In C++17 we need add macro manually
+// YLT_REFL(person, name, age);
 
 int main() {
   person p{.name = "tom", .age = 20};
@@ -274,7 +309,9 @@ struct person {
   std::string name;
   int age;
 };
-YLT_REFL(person, name, age);
+
+// static reflection works in C++20. In C++17 we need add macro manually
+// YLT_REFL(person, name, age);
 
 void basic_usage() {
   std::string xml = R"(
@@ -308,7 +345,9 @@ struct person {
   std::string name;
   int age;
 };
-YLT_REFL(person, name, age);
+
+// static reflection works in C++20. In C++17 we need add macro manually
+// YLT_REFL(person, name, age);
 
 void basic_usage() {
     // serialization the structure to the string
@@ -438,11 +477,11 @@ See [async_simple](https://github.com/alibaba/async_simple)
 
 ## config option
 
-These option maybe useful for your project. You can enable it in your project if you import ylt by cmake fetchContent or find_package. 
+These option maybe useful for your project. The value could be `ON` or `OFF`. You can enable it in your project if you import ylt by cmake fetchContent or find_package. 
 
 |option|default value|description|
 |----------|------------|------|
-|YLT_ENABLE_SSL|OFF|enable optional ssl support for rpc/http|
+|YLT_ENABLE_SSL|automatic|enable optional ssl support for rpc/htt, if you install openssl, it will be enabled by default|
 |YLT_ENABLE_PMR|OFF|enable pmr optimize|
 |YLT_ENABLE_IO_URING|OFF|enable io_uring in linux|
 |YLT_ENABLE_FILE_IO_URING|OFF|enable file io_uring as backend in linux|
@@ -524,6 +563,28 @@ options:
 ./benchmark_client # [threads = hardware counts] [client_pre_thread = 20] [pipeline_size = 1] [host = 127.0.0.1] [port = 9000] [test_data_path = ./test_data/echo_test] [test_seconds = 30] [warm_up_seconds = 5]
 ```
 
+## cross language support
+### how to use coro_http with python
+See `yalantinglibs/src/coro_http/examples/py_example`
+
+#### build and run py_example
+- Set option `ENABLE_pybind11`(in `yalantinglibs/src/coro_http/examples/CMakeLists.txt`) `ON` and then build `py_example`.
+
+- go to `yalantinglibs/src/coro_http/examples/py_example`
+
+- python3 test.py
+
+### how to use coro_rpc with golang
+See `yalantinglibs/src/coro_rpc/examples/basic_example/go_example`
+
+#### build and run go_example
+- Set option `ENABLE_go`(in `yalantinglibs/src/coro_rpc/examples/base_examples/CMakeLists.txt`) `ON` and then build `coro_rpc`.
+
+- go to `yalantinglibs/src/coro_rpc/examples/base_examples/go_example`
+
+- go build test_rpc.go
+
+- ./test_rpc
 
 ## How to generate document
 
