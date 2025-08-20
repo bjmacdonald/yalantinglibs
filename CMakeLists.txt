@@ -12,6 +12,7 @@ list(APPEND CMAKE_MODULE_PATH ${PROJECT_SOURCE_DIR}/cmake/Find/)
 find_package(Threads REQUIRED)
 link_libraries(Threads::Threads)
 
+include(cmake/conan.cmake)
 include(cmake/install.cmake)
 
 if(CMAKE_PROJECT_NAME STREQUAL "yaLanTingLibs") # if ylt is top-level project
