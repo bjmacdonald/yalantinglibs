@@ -1,12 +1,14 @@
 #pragma once
 
 #include <chrono>
+#include <cinttypes>
 #include <cstdint>
 #include <cstdio>
 #include <fstream>
 #include <memory>
 #include <system_error>
 
+#include "ylt/easylog.hpp"
 #if __has_include("ylt/coro_io/coro_io.hpp")
 #include "ylt/coro_io/coro_io.hpp"
 #include "ylt/coro_io/io_context_pool.hpp"
@@ -53,6 +55,7 @@ inline int read_command_output_through_popen(std::ostream& os,
         break;
       }
       else if (ferror(pipe)) {
+        ELOG_ERROR << "Encountered error while reading for the pipe";
         break;
       }
       // retry;
@@ -179,15 +182,19 @@ inline void stat_memory() {
   char cmdbuf[128];
   snprintf(cmdbuf, sizeof(cmdbuf), "ps -p %ld -o rss=,vsz=", (long)pid);
   if (read_command_output_through_popen(oss, cmdbuf) != 0) {
+    ELOG_ERROR << "Fail to read memory state";
     return;
   }
   const std::string& result = oss.str();
-  if (sscanf(result.c_str(), "%ld %ld", &resident, &virtual_size) != 2) {
+  if (sscanf(result.c_str(), "%" PRId64 " %" PRId64, &resident,
+             &virtual_size) != 2) {
+    ELOG_WARN << "Fail to sscanf";
     return;
   }
 #else
   std::ifstream file("/proc/self/statm");
   if (!file) {
+    ELOG_WARN << "Fail to open /proc/self/statm";
     return;
   }
 
@@ -239,6 +246,7 @@ inline void stat_io() {
         fclose(ptr);
       });
   if (stream_file == nullptr) {
+    ELOG_WARN << "Fail to open /proc/self/io";
     return;
   }
 
@@ -246,6 +254,7 @@ inline void stat_io() {
              "%*s %lu %*s %lu %*s %lu %*s %lu %*s %lu %*s %lu %*s %lu",
              &s.rchar, &s.wchar, &s.syscr, &s.syscw, &s.read_bytes,
              &s.write_bytes, &s.cancelled_write_bytes) != 7) {
+    ELOG_WARN << "Fail to fscanf";
     return;
   }
 #endif
@@ -280,16 +289,19 @@ inline void stat_avg_load() {
 #if defined(__APPLE__)
   std::ostringstream oss;
   if (read_command_output_through_popen(oss, "sysctl -n vm.loadavg") != 0) {
+    ELOG_ERROR << "Fail to read loadavg";
     return;
   }
   const std::string& result = oss.str();
   if (sscanf(result.c_str(), "{ %lf %lf %lf }", &loadavg_1m, &loadavg_5m,
              &loadavg_15m) != 3) {
+    ELOG_WARN << "Fail to sscanf";
     return;
   }
 #else
   std::ifstream file("/proc/loadavg");
   if (!file) {
+    ELOG_WARN << "Fail to open /proc/loadavg";
     return;
   }
 
@@ -357,6 +369,7 @@ inline void process_status() {
         fclose(ptr);
       });
   if (stream_file == nullptr) {
+    ELOG_WARN << "Fail to open /proc/self/stat";
     return;
   }
 
@@ -371,6 +384,7 @@ inline void process_status() {
              &stat.cminflt, &stat.majflt, &stat.cmajflt, &stat.utime,
              &stat.stime, &stat.cutime, &stat.cstime, &stat.priority,
              &stat.nice, &stat.num_threads) != 19) {
+    ELOG_WARN << "Fail to fscanf";
     return;
   }
 #elif defined(__APPLE__)
@@ -382,6 +396,7 @@ inline void process_status() {
            ",tpgid,flags,pri,nice | tail -n1",
            (long)proc_id);
   if (read_command_output_through_popen(oss, cmdbuf) != 0) {
+    ELOG_ERROR << "Fail to read stat";
     return;
   }
   const std::string& result = oss.str();
@@ -390,6 +405,7 @@ inline void process_status() {
              "%d %u %ld %ld",
              &stat.pid, &stat.ppid, &stat.pgrp, &stat.session, &stat.tpgid,
              &stat.flags, &stat.priority, &stat.nice) != 8) {
+    ELOG_WARN << "Fail to sscanf";
     return;
   }
 #endif

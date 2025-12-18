@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.15)
 project(yaLanTingLibs
-        VERSION 0.5.5
+        VERSION 0.5.6
         DESCRIPTION "yaLanTingLibs"
         HOMEPAGE_URL "https://github.com/alibaba/yalantinglibs"
         LANGUAGES CXX
@@ -23,6 +23,7 @@ if(CMAKE_PROJECT_NAME STREQUAL "yaLanTingLibs") # if ylt is top-level project
         include_directories(src/include)
 
         include(cmake/Find/find_openssl.cmake)
+        include(cmake/Find/find_ntls.cmake)
         include(cmake/Find/find_ibverbs.cmake)
         include(cmake/utils.cmake)
         include(cmake/build.cmake)

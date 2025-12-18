@@ -68,8 +68,9 @@ Once SSL support has been enabled, users can invoke the `init_ssl` function befo
 client.init_ssl("./","server.crt");
 ```
 
-
 The first string represents the base path where the SSL certificate is located, the second string represents the relative path of the SSL certificate relative to the base path.
+
+We also support NTLS if you enable it by CMAKE OPTION `YLT_ENABLE_NTLS`.
 
 ## Conversion and compile-time checking of RPC parameters
 
@@ -123,7 +124,7 @@ The configuration for IBVerbs socket protocol is shown below:
 struct ib_socket_t::config_t {
   uint32_t cq_size = 128; // Maximum length of event notification queue
   uint32_t recv_buffer_cnt = 8;                 // Number of buffers pre-submitted to receive queue. Each buffer defaults to 256KB, so a RDMA connection occupies 8MB memory immediately after establishment. More pending receive data will result in more buffers in the queue, up to max_recv_wr*buffer_size (where buffer_size is configured in buffer_pool). If upper layer doesn't consume data, sender will receive RNR (Receiver Not Ready) errors and retry continuously.
-  uint32_t send_buffer_cnt = 2;                 // default send buffer queue max size,
+  uint32_t send_buffer_cnt = 4;                 // default send buffer queue max size,
   ibv_qp_type qp_type = IBV_QPT_RC;             // Default QP type
   ibv_qp_cap cap = {.max_send_wr = 32,           // Maximum send queue length
                     .max_recv_wr = 32,          // Maximum receive queue length
@@ -180,14 +181,13 @@ By modifying the configuration of `ib_device_t`, users can assign different netw
 3. Create and use your own `ib_device_t`
 ```cpp
   auto dev = coro_io::ib_device_t::create({
-    .dev_name = nullptr,  // If dev_name is nullptr, it will use the first device in list
-    .buffer_pool_config = {
-      // ...
-    }
-  });
-  coro_rpc_client cli;
-  cli.init_ibv({
-    .device = dev
+      .dev_name = "",  // If dev_name is empty, the first device in the device list will be used.
+      .port = 1,       // Manually specify the NIC port number.
+      .use_best_gid_index = true,  // Automatically find the best GID index for this device.
+      .gid_index = 0,   // Manually specify the GID index; takes effect when automatic lookup is disabled or fails.
+      .buffer_pool_config = {
+        // ...
+      }
   });
 ```
 

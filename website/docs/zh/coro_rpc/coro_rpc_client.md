@@ -74,6 +74,8 @@ client.init_ssl("./","server.crt");
 
 当建立连接时，客户端会使用该证书校验服务端发来的证书，以避免中间人攻击。因此，客户端必须持有服务端使用的证书或其根证书。
 
+我们同样支持国密NTLS。你需要开启CMAKE选项`YLT_ENABLE_NTLS`。
+
 ## RPC参数的转换与编译期检查
 
 coro_rpc会在调用的时候对参数的合法性做编译期检查，比如，对于如下rpc函数：
@@ -126,7 +128,7 @@ ibverbs协议的配置如下：
 struct ib_socket_t::config_t {
   uint32_t cq_size = 128; // 事件通知队列的最大长度
   uint32_t recv_buffer_cnt = 8;                 // 默认提交到接受队列的缓冲数目，一个缓冲区默认256KB。积压的接收数据越多，队列中的缓冲区也会越多，最多可以缓冲max_recv_wr*buffer_size这么多的数据(buffer_size为buffer_pool配置的缓冲区大小），此后如果上层仍不消费数据，则发送端会收到rnr错误，不断重试并等待对端消费。
-  uint32_t send_buffer_cnt = 2;                 // 默认的发送缓冲区队列长度上限。代表最多积压的发送缓冲区数目。
+  uint32_t send_buffer_cnt = 4;                 // 默认的发送缓冲区队列长度上限。代表最多积压的发送缓冲区数目。
   ibv_qp_type qp_type = IBV_QPT_RC;             // 默认的qp类型。
   ibv_qp_cap cap = {.max_send_wr = 32,           // 发送队列的最大长度。
                     .max_recv_wr = 32,          // 接受队列的最大长度
@@ -184,10 +186,13 @@ struct ib_socket_t::config_t {
 3. 创建并使用自己的 `ib_device_t`
 ```cpp
   auto dev = coro_io::ib_device_t::create({
-    .dev_name=nullptr,  // 如果 dev_name 为 nullptr，则会使用设备列表中的第一个设备
+    .dev_name = "",  // 如果 dev_name 为 空，则会使用设备列表中的第一个设备
+    .port = 1, // 手动指定网卡port
+    .use_best_gid_index = true, // 自动查找该设备最佳的gid_index
+    .gid_index = 0, // 手动指定gid_index，当关闭自动查找或自动查找失败时生效
     .buffer_pool_config = {
       // ...
-    }
+    },
   });
   coro_rpc_client cli;
   cli.init_ibv({
