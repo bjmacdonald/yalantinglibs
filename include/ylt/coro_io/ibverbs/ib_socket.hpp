@@ -96,16 +96,6 @@ struct ib_buffer_queue : public circle_buffer<ib_buffer_t> {
   std::error_code push_recv(ib_buffer_t buf, ib_socket_shared_state_t* state);
 };
 
-inline void check_qp_state(struct ibv_qp* qp, enum ibv_qp_state expected) {
-  struct ibv_qp_attr attr;
-  struct ibv_qp_init_attr init_attr;
-  ibv_query_qp(qp, &attr, IBV_QP_STATE, &init_attr);
-  if (attr.qp_state != expected) {
-    ELOG_ERROR << " QP state = " << attr.qp_state
-               << " (expected =" << (int)expected << ")\n";
-  }
-}
-
 struct ib_socket_shared_state_t
     : std::enable_shared_from_this<ib_socket_shared_state_t> {
   using callback_t = async_simple::util::move_only_function<void(
@@ -303,7 +293,6 @@ struct ib_socket_shared_state_t
     }
     // post the receive request to the RQ
     else {
-      check_qp_state(qp_.get(), ibv_qp_state::IBV_QPS_RTS);
       if (auto ec = ibv_post_send(qp_.get(), &sr, &bad_wr); ec) [[unlikely]] {
         err = std::make_error_code(std::errc{std::abs(ec)});
         ELOG_ERROR << "ibv post send failed: " << err.message();
